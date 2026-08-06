@@ -1,0 +1,49 @@
+{{- range $svcName, $svc := .Values.externalServices }}
+{{- if eq $svcName (include "app.name" $) }}
+{{- fail (printf "externalServices.%s collides with the app's own Service — pick another name" $svcName) }}
+{{- end }}
+{{- $port := required (printf "externalServices.%s.port is required" $svcName) $svc.port }}
+{{- $target := $svc.targetPort | default $port }}
+---
+# A Service with no selector, plus a hand-written EndpointSlice. That pair is
+# how a name inside the cluster is pointed at something outside it — here, a
+# container on the VM's own Docker.
+#
+# The point is the indirection: the app connects to `{{ $svcName }}:{{ $port }}`
+# and does not know or care where that is. Move the backend, or move it into
+# the cluster later, and only this entry changes — not the app's config, and not
+# the connection string in Infisical.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svcName }}
+  namespace: {{ include "app.namespace" $ }}
+  labels:
+    {{- include "app.labels" $ | nindent 4 }}
+spec:
+  # No selector, deliberately. Adding one would make Kubernetes manage the
+  # endpoints itself and wipe the one below.
+  ports:
+    - port: {{ $port }}
+      targetPort: {{ $target }}
+      protocol: TCP
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: {{ $svcName }}
+  namespace: {{ include "app.namespace" $ }}
+  labels:
+    {{- include "app.labels" $ | nindent 4 }}
+    # This label is what binds the slice to the Service. Without it the Service
+    # resolves to nothing, with no error anywhere.
+    kubernetes.io/service-name: {{ $svcName }}
+addressType: IPv4
+ports:
+  - port: {{ $target }}
+    protocol: TCP
+endpoints:
+  - addresses:
+      # Must be an IP — addressType: IPv4 does not accept hostnames.
+      - {{ required (printf "externalServices.%s.address is required" $svcName) $svc.address | quote }}
+{{- end }}

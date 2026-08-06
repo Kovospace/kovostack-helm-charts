@@ -1,0 +1,116 @@
+---
+# The only required value. Everything else is derived from it:
+#
+#   namespace              <name>
+#   Infisical folder       /<name>
+#   generated Secret       <name>-secrets
+#   TLS Secret             <name>-tls
+#
+# Override the derived values below only where an app genuinely differs.
+name: ""
+
+# --- workload ---------------------------------------------------------------
+# Leave `image` empty and no Deployment or Service is rendered — the chart then
+# provides only the namespace, secrets and ingress for an app whose workload
+# comes from its own chart.
+image: ""
+imageTag: ""
+imagePullPolicy: IfNotPresent
+replicas: 1
+containerPort: 8080
+
+# Plain env vars. Anything sensitive belongs in Infisical, not here — it is
+# injected wholesale from the synced Secret via envFrom.
+env: {}
+
+resources: {}
+#  requests: {cpu: 50m, memory: 64Mi}
+#  limits:   {memory: 256Mi}
+
+# Probed on containerPort when set. Empty disables the probe rather than
+# defaulting to "/", which would mark apps healthy that merely 404.
+healthPath: ""
+
+# --- services outside the cluster --------------------------------------------
+# Things running on the VM but not in Kubernetes — Postgres, Redis, anything in
+# the platform's Docker stack. Each entry becomes a selector-less Service plus a
+# matching EndpointSlice, so the app reaches it by name:
+#
+#   externalServices:
+#     postgres:
+#       address: 172.17.0.1     # must be an IP, not a hostname
+#       port: 5432
+#
+#   -> the app connects to postgres:5432
+#
+# `address` has to be one the pods can actually reach. The host's 127.0.0.1 is
+# not it — inside a pod that is the pod's own loopback. Bind the container to a
+# host address instead (POSTGRES_BIND in the platform .env) and use that.
+# Prefer a private one such as the docker0 gateway over the VM's public IP: a
+# database on a public address is protected only by a firewall rule.
+externalServices: {}
+
+# --- storage ----------------------------------------------------------------
+# Each entry becomes a PersistentVolumeClaim named <name>-<key>, mounted into
+# the container at mountPath. Keys are yours to choose.
+#
+#   persistence:
+#     data:
+#       size: 1Gi
+#       mountPath: /app/data
+#     uploads:
+#       size: 10Gi
+#       mountPath: /app/uploads
+#
+# Per entry: size and mountPath are required; storageClass, accessMode (default
+# ReadWriteOnce) and subPath are optional.
+#
+# Class for app volumes. local-path-retain keeps the data on disk when a PVC is
+# deleted, unlike k3s' stock local-path which deletes it with the claim. Set to
+# "" per entry for the cluster default, for data that is genuinely disposable.
+storageClass: local-path-retain
+#
+# ReadWriteOnce volumes cannot be attached to two pods at once, so the chart
+# switches the Deployment to the Recreate strategy and refuses replicas > 1 as
+# soon as any volume exists. That is deliberate: a rolling update would
+# otherwise briefly run two pods against one SQLite file and corrupt it.
+persistence: {}
+
+# --- ingress ----------------------------------------------------------------
+# Leave `host` empty for an app with no public route (worker, cron, internal).
+host: ""
+ingressClassName: traefik
+clusterIssuer: letsencrypt-production
+servicePort: 80
+
+# --- private registry -------------------------------------------------------
+# Pulling from the platform's zot needs credentials — anonymous access is denied
+# there. The password never enters git: it is read from Infisical and rendered
+# into a dockerconfigjson Secret in the app's namespace.
+registry:
+  # An image whose name starts with this host gets a pull secret automatically;
+  # public images (traefik/whoami, ghcr.io/...) do not. Must match REGISTRY_HOST
+  # in the platform repo's .env.
+  host: registry.matejkovac.sk
+
+  # The read-only robot from zot's accessControl: it can pull apps/** and
+  # charts/**, and cannot push anything.
+  username: k8s
+
+  # Where that robot's password lives in Infisical. Shared by every app, so it
+  # is deliberately not the app's own folder.
+  secretsPath: /platform
+  passwordKey: ZOT_K8S_PASSWORD
+
+  # Empty = decide from `image`. Set true for an app whose workload lives in its
+  # own chart, where `image` is empty here and there is nothing to detect.
+  pullSecret: ""
+
+# --- secrets ----------------------------------------------------------------
+secrets:
+  enabled: true
+  store: infisical
+  refreshInterval: 1h
+  # Infisical folder to sync. Defaults to /<name> — the convention. Set this
+  # only when an app must read a folder that is not named after it.
+  path: ""

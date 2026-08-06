@@ -1,0 +1,14 @@
+---
+# App namespaces are owned by their own chart, unlike the infrastructure ones in
+# namespaces/. The rule is unchanged though: exactly one owner per namespace, so
+# app Applications set CreateNamespace=false.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "app.namespace" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+    kubernetes.io/metadata.name: {{ include "app.namespace" . }}
+  annotations:
+    # Before the workload and the ExternalSecret that land inside it.
+    argocd.argoproj.io/sync-wave: "-5"

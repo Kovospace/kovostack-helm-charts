@@ -1,0 +1,42 @@
+{{- range $key, $vol := .Values.persistence }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "app.name" $ }}-{{ $key }}
+  namespace: {{ include "app.namespace" $ }}
+  labels:
+    {{- include "app.labels" $ | nindent 4 }}
+  annotations:
+    # Deliberately NO sync-wave. An earlier wave deadlocks: ArgoCD waits for the
+    # PVC to report Healthy before starting the next wave, but a
+    # WaitForFirstConsumer volume stays Pending until a pod consumes it — and
+    # that pod is in the later wave. Each side waits for the other, forever.
+    #
+    # No ordering is needed anyway: a pod referencing a PVC that does not exist
+    # yet stays Pending until it does, which is the same result without the
+    # deadlock.
+    #
+    # NOT Prune=false. That kept the claim, but ArgoCD then reported the app
+    # OutOfSync forever over a resource it had been told never to remove, which
+    # blocked every later sync — it protected the data by breaking the delivery
+    # of everything else.
+    #
+    # Delete=false is narrower: it only stops the claim being swept up when the
+    # Application itself is deleted. Normal pruning still works, so removing a
+    # volume from values.yaml removes the claim and the app stays Synced.
+    argocd.argoproj.io/sync-options: Delete=false
+spec:
+  accessModes:
+    - {{ $vol.accessMode | default "ReadWriteOnce" }}
+  resources:
+    requests:
+      storage: {{ required (printf "persistence.%s.size is required" $key) $vol.size }}
+  {{- /* `default` would treat an explicit "" as unset, making it impossible to
+         opt back out to the cluster default. hasKey distinguishes the two. */}}
+  {{- $sc := $.Values.storageClass }}
+  {{- if hasKey $vol "storageClass" }}{{ $sc = $vol.storageClass }}{{ end }}
+  {{- with $sc }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
