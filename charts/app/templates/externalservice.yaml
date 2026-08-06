@@ -39,11 +39,23 @@ metadata:
     # resolves to nothing, with no error anywhere.
     kubernetes.io/service-name: {{ $svcName }}
 addressType: IPv4
+# `name` and `conditions` below are what the API server would fill in anyway.
+# They are written out because `ports` and `endpoints` are both atomic lists
+# (`x-kubernetes-list-type: atomic`), which are compared as one opaque unit: a
+# field the server defaults inside them cannot be ignored by the three-way
+# merge, so the rendered manifest never equals the live object and ArgoCD
+# reports the app OutOfSync forever, re-applying it on every reconcile.
 ports:
-  - port: {{ $target }}
+  # Empty, because the Service above names no port either. The two must agree
+  # or kube-proxy will not map one onto the other.
+  - name: ""
+    port: {{ $target }}
     protocol: TCP
 endpoints:
   - addresses:
       # Must be an IP — addressType: IPv4 does not accept hostnames.
       - {{ required (printf "externalServices.%s.address is required" $svcName) $svc.address | quote }}
+    # A nil `ready` already counts as ready; stating it keeps the diff empty.
+    conditions:
+      ready: true
 {{- end }}
