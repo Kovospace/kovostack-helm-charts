@@ -26,6 +26,23 @@ That renders a Namespace, an ExternalSecret syncing Infisical `/whoami`, a
 Deployment with those secrets as env vars, a Service, and an Ingress with a
 cert-manager certificate.
 
+## Images
+
+Everything this platform builds is pushed under `apps/` in zot, so a **bare
+`image` is one of ours** and the chart expands it:
+
+| `image` | pulled as |
+|---|---|
+| `nsr` | `registry.matejkovac.sk/apps/nsr` |
+| `traefik/whoami` | `traefik/whoami` |
+| `ghcr.io/owner/thing` | `ghcr.io/owner/thing` |
+| `registry.matejkovac.sk/apps/nsr` | unchanged |
+
+The rule is the slash: anything containing one is already a full reference and
+is taken as written, so third-party images and previously spelled-out paths both
+keep working. `imageTag` is appended to whichever form results, and defaults to
+`latest`.
+
 ## What renders when
 
 Two values act as switches, so the chart also suits apps that are not a simple
@@ -58,10 +75,10 @@ one named after itself — the convention is the feature.
 ## Pulling from the private registry
 
 zot denies anonymous access, so an image from it needs a credential. The chart
-renders one **automatically when `image` starts with `registry.host`**: a public
-image gets nothing, `registry.matejkovac.sk/apps/nsr` gets a
-`kubernetes.io/dockerconfigjson` Secret named `<name>-registry` plus the
-matching `imagePullSecrets` entry.
+renders one **automatically when the resolved image sits on `registry.host`**: a
+public image gets nothing, while `nsr` — or the long
+`registry.matejkovac.sk/apps/nsr` — gets a `kubernetes.io/dockerconfigjson`
+Secret named `<name>-registry` plus the matching `imagePullSecrets` entry.
 
 There is no dockerconfigjson in git, and there should never be one — that file
 is base64, not encryption, so committing it publishes the robot's password. Git

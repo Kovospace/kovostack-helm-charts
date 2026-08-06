@@ -36,7 +36,7 @@ spec:
       {{- end }}
       containers:
         - name: {{ include "app.name" . }}
-          image: "{{ .Values.image }}:{{ .Values.imageTag | default "latest" }}"
+          image: "{{ include "app.imageRepository" . }}:{{ .Values.imageTag | default "latest" }}"
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           ports:
             - name: http

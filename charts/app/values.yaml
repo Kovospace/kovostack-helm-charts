@@ -13,6 +13,11 @@ name: ""
 # Leave `image` empty and no Deployment or Service is rendered — the chart then
 # provides only the namespace, secrets and ingress for an app whose workload
 # comes from its own chart.
+#
+# A bare name is one of ours: everything this platform builds is pushed under
+# `apps/` in zot, so `image: nsr` becomes registry.matejkovac.sk/apps/nsr.
+# Anything with a slash is taken as written — traefik/whoami, ghcr.io/owner/x,
+# or the spelled-out registry.matejkovac.sk/apps/nsr.
 image: ""
 imageTag: ""
 imagePullPolicy: IfNotPresent
@@ -88,9 +93,10 @@ servicePort: 80
 # there. The password never enters git: it is read from Infisical and rendered
 # into a dockerconfigjson Secret in the app's namespace.
 registry:
-  # An image whose name starts with this host gets a pull secret automatically;
-  # public images (traefik/whoami, ghcr.io/...) do not. Must match REGISTRY_HOST
-  # in the platform repo's .env.
+  # Where a bare `image` is resolved against, as <host>/apps/<image>. An image
+  # that ends up on this host gets a pull secret automatically; public ones
+  # (traefik/whoami, ghcr.io/...) do not. Must match REGISTRY_HOST in the
+  # platform repo's .env.
   host: registry.matejkovac.sk
 
   # The read-only robot from zot's accessControl: it can pull apps/** and

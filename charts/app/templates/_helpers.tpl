@@ -34,17 +34,34 @@ so changing a rule changes it everywhere at once.
 {{- end -}}
 
 {{/*
+The image repository, without the tag.
+
+Everything this platform builds lives under `apps/` in zot, so a bare `image`
+means "our own app" and is expanded to <registry.host>/apps/<image>. Anything
+containing a slash is already a full reference — traefik/whoami, ghcr.io/x/y, or
+a spelled-out registry.matejkovac.sk/apps/nsr — and passes through untouched.
+*/}}
+{{- define "app.imageRepository" -}}
+{{- if contains "/" .Values.image -}}
+{{- .Values.image -}}
+{{- else -}}
+{{- printf "%s/apps/%s" .Values.registry.host .Values.image -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Whether this app pulls from the platform's private registry.
 
-Auto-detected from the image, so a public image (traefik/whoami) gets no pull
-secret and a zot one does. `registry.pullSecret: true` forces it on — needed
-when the workload lives in the app's own chart and `image` is empty here, since
-there is then nothing to detect from.
+Auto-detected from the resolved repository, so a public image (traefik/whoami)
+gets no pull secret and a zot one does — including the bare form, which is
+always ours. `registry.pullSecret: true` forces it on — needed when the workload
+lives in the app's own chart and `image` is empty here, since there is then
+nothing to detect from.
 */}}
 {{- define "app.usePullSecret" -}}
 {{- if ne (toString .Values.registry.pullSecret) "" -}}
 {{- if .Values.registry.pullSecret -}}true{{- end -}}
-{{- else if and .Values.image (hasPrefix .Values.registry.host .Values.image) -}}
+{{- else if and .Values.image (hasPrefix .Values.registry.host (include "app.imageRepository" .)) -}}
 true
 {{- end -}}
 {{- end -}}
