@@ -84,6 +84,19 @@ persistence: {}
 # --- ingress ----------------------------------------------------------------
 # Leave `host` empty for an app with no public route (worker, cron, internal).
 host: ""
+
+# Serve www.<host> as well, on the same certificate. For an apex domain
+# (kovo.space) that is what visitors type; for a subdomain
+# (nsr.matejkovac.sk) www.nsr.matejkovac.sk is meaningless, which is why this
+# is off by default.
+#
+# `www.<host>` needs its own DNS record pointing at the cluster *before* this
+# is enabled. Without one the HTTP-01 challenge for that name fails, and
+# because both names share a certificate the failure takes the apex down with
+# it — an already-serving site loses TLS. Let's Encrypt also rate-limits
+# failures at 5/hour per domain, so validate against clusterIssuer
+# letsencrypt-staging first.
+wwwAlias: false
 ingressClassName: traefik
 clusterIssuer: letsencrypt-production
 servicePort: 80

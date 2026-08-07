@@ -1,4 +1,11 @@
 {{- if .Values.host }}
+{{- $hosts := list .Values.host }}
+{{- if .Values.wwwAlias }}
+{{- if hasPrefix "www." .Values.host }}
+{{- fail (printf "host %q already starts with www. — wwwAlias would ask for www.%s" .Values.host .Values.host) }}
+{{- end }}
+{{- $hosts = append $hosts (printf "www.%s" .Values.host) }}
+{{- end }}
 ---
 # cert-manager's ingress-shim turns this annotation plus the tls block into a
 # Certificate — no Certificate resource is written by hand anywhere in this repo.
@@ -14,18 +21,26 @@ metadata:
 spec:
   ingressClassName: {{ .Values.ingressClassName }}
   tls:
+    # One certificate covering every name below. A SAN whose DNS record is
+    # missing fails the HTTP-01 challenge and takes the *whole* certificate
+    # with it — the apex included — so point www at the cluster before turning
+    # wwwAlias on, not after.
     - hosts:
-        - {{ .Values.host | quote }}
+        {{- range $hosts }}
+        - {{ . | quote }}
+        {{- end }}
       secretName: {{ include "app.tlsSecretName" . }}
   rules:
-    - host: {{ .Values.host | quote }}
+    {{- range $hosts }}
+    - host: {{ . | quote }}
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: {{ include "app.name" . }}
+                name: {{ include "app.name" $ }}
                 port:
-                  number: {{ .Values.servicePort }}
+                  number: {{ $.Values.servicePort }}
+    {{- end }}
 {{- end }}

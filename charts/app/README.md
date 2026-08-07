@@ -54,6 +54,32 @@ web deployment:
   anything with no public route.
 - **`secrets.enabled: false`** → no ExternalSecret, for an app with no secrets.
 
+## Serving www as well
+
+`wwwAlias: true` adds `www.<host>` as a second rule on the Ingress and a second
+name on the same certificate:
+
+```yaml
+host: kovo.space
+wwwAlias: true      # serves kovo.space and www.kovo.space
+```
+
+Off by default, because it only makes sense for an apex domain — for
+`nsr.matejkovac.sk`, `www.nsr.matejkovac.sk` is not a name anyone types. The
+chart refuses a `host` that already starts with `www.` rather than asking for
+`www.www.…`.
+
+⚠️ **Create the DNS record first.** Both names share one certificate, so if
+`www.<host>` has no record pointing at the cluster, its HTTP-01 challenge fails
+and the whole certificate fails with it — including the apex, which was serving
+fine a minute earlier. Let's Encrypt rate-limits *failures* at 5/hour per
+domain, so switch `clusterIssuer` to `letsencrypt-staging` until
+`kubectl -n <app> get certificate` reports `READY=True`, then flip it back.
+
+Both names serve the app directly; neither redirects to the other. Search
+engines treat them as duplicate content, so pick one as canonical in the app
+itself, or add a Traefik redirect middleware.
+
 ## Secrets
 
 Everything in the app's Infisical folder is synced into one Secret and mounted
