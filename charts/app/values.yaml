@@ -128,8 +128,33 @@ registry:
 # --- secrets ----------------------------------------------------------------
 secrets:
   enabled: true
+
+  # The *shared* cluster store, used only for the registry credential in
+  # /platform (see registry.secretsPath). The app's own secrets come from a
+  # per-app store this chart renders instead — see templates/secretstore.yaml.
   store: infisical
+
   refreshInterval: 1h
+
   # Infisical folder to sync. Defaults to /<name> — the convention. Set this
   # only when an app must read a folder that is not named after it.
+  #
+  # This scopes the per-app store, which is the only thing the Infisical
+  # provider actually honours; it is not a filter on the ExternalSecret.
   path: ""
+
+  # Connection settings for the per-app ClusterSecretStore.
+  #
+  # These must match the `infisical.*` block in the gitops repo's
+  # infrastructure/external-secrets/values.yaml — same Infisical, same project,
+  # same environment, same machine identity. They are duplicated here because a
+  # store has to be rendered per app to scope it, and the chart cannot read the
+  # infrastructure chart's values. Change one, change the other.
+  infisical:
+    hostAPI: https://secrets.matejkovac.sk
+    projectSlug: kovostack
+    environmentSlug: prod
+    # NAME and namespace of the Kubernetes Secret holding the machine identity,
+    # not the credential itself. Created by hand at bootstrap.
+    credentialsSecret: infisical-credentials
+    credentialsNamespace: external-secrets

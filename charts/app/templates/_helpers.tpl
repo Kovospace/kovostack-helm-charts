@@ -29,6 +29,17 @@ so changing a rule changes it everywhere at once.
 {{- end -}}
 {{- end -}}
 
+{{/*
+The app's own ClusterSecretStore, scoped to its Infisical folder.
+
+Cluster-scoped names are global, so this is prefixed rather than just `<name>`
+— it sits alongside the shared `infisical` store, which now serves only the
+registry credential in /platform.
+*/}}
+{{- define "app.storeName" -}}
+{{- printf "infisical-%s" (include "app.name" .) -}}
+{{- end -}}
+
 {{- define "app.pullSecretName" -}}
 {{- printf "%s-registry" (include "app.name" .) -}}
 {{- end -}}

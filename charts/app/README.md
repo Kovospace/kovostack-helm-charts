@@ -94,9 +94,40 @@ Consequences worth knowing:
   in an app's folder.
 - The Secret is `creationPolicy: Owner`, so deleting the app deletes its
   credentials from the cluster rather than orphaning them.
+- Key names only have to be unique **within** the folder. Two apps may both have
+  a `PAYLOAD_SECRET`; see below for why that is worth stating.
 
 Override the folder with `secrets.path` only when an app genuinely cannot own
 one named after itself — the convention is the feature.
+
+### Why each app gets its own store
+
+The chart renders a `ClusterSecretStore` per app (`infisical-<name>`), scoped to
+that app's folder with `recursive: false`, and the app's ExternalSecret reads
+from it.
+
+That looks redundant next to `dataFrom.find.path`, and it is not.
+external-secrets' Infisical provider **does not send `find.path` to the API**:
+it fetches whatever the *store* is scoped to, then flattens the response into a
+map keyed by secret name alone. With every app sharing one store rooted at `/`
+with `recursive: true`, each app pulled the entire project on every refresh, and
+two folders holding the same key name collided — one app got the value, the
+other silently got nothing, with no error and a green sync. Which app won could
+change on any resync.
+
+That is not hypothetical: `/kovo` and `/nsr` both hold `PAYLOAD_SECRET`, and
+`/paster-backend` and `/music-pages-scraper-backend` both hold
+`SPRING_DATASOURCE_USER` and `SPRING_DATASOURCE_PASS`. Three keys, three apps
+quietly missing an env var.
+
+Scoping the store is what actually narrows the fetch, so an app can only ever
+see its own folder. The cost is that `secrets.infisical.*` in `values.yaml`
+duplicates the `infisical.*` block in the gitops repo's
+`infrastructure/external-secrets/values.yaml` — same host, project, environment
+and machine identity. **Change one, change the other.**
+
+The shared `infisical` store still exists and is still rooted at `/`, but its
+only remaining consumer is the registry credential below.
 
 ## Pulling from the private registry
 
@@ -129,6 +160,10 @@ kubelet pulls  registry.matejkovac.sk/apps/<app>
 - Set `registry.pullSecret: true` for an app whose workload lives in its own
   chart: `image` is empty here, so there is nothing to detect. That chart then
   references `<name>-registry` itself.
+- This is the one thing still read through the shared `infisical` store, which
+  is rooted at `/` and recursive. `registry.passwordKey` must therefore stay
+  unique across every folder in the project — see "Why each app gets its own
+  store". App secrets are not subject to this.
 - Rotating the password is a change in Infisical only. New pulls pick it up on
   the next refresh; running pods are unaffected, their pull already happened.
 
