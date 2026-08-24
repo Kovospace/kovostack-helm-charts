@@ -36,6 +36,53 @@ resources: {}
 # defaulting to "/", which would mark apps healthy that merely 404.
 healthPath: ""
 
+# --- init containers ---------------------------------------------------------
+# Steps that must finish before the app container starts — a database
+# migration, a seed, waiting on a dependency. Kubernetes runs them one at a
+# time, in order, and the first failure stops the pod there.
+#
+# A *list*, not a map like `persistence` and `externalServices`: Helm iterates
+# map keys in sorted order, so a map would silently reorder your steps. The
+# order you write is the order they run.
+#
+#   initContainers:
+#     - image: nsr-migrate            # expanded like `image` above
+#       command: ["./manage.py", "migrate"]
+#     - image: nsr-seed
+#
+# Each entry inherits, without repeating any of it:
+#
+#   envFrom   the app's synced Secret — every key in its Infisical folder
+#   env       everything in `env:` above, overridable per entry
+#   volumes   the same `persistence:` mounts, at the same paths
+#
+# so a migration reads the same DATABASE_URL as the app by construction. That
+# is the answer to "where do the parameters come from": the same two places the
+# app container gets them, and nothing has to be wired twice.
+#
+# Per entry — only `image` is required:
+#
+#   image            required; bare name = ours, slash = taken as written
+#   imageTag         defaults below
+#   name             defaults to init-<last path segment of image>
+#   command, args    override the image's entrypoint
+#   env              extra vars for this step; wins over the shared `env:`
+#   resources        as on the app container
+#   imagePullPolicy  defaults to `imagePullPolicy` above
+#
+# Tags: an entry with no `imageTag` that resolves to *our* registry rides the
+# app's `imageTag`, because a migrate image is built by the same pipeline and
+# carries the same version — one bump in versions/<app>.yaml moves both.
+#
+# An image from anywhere else has no such relationship and falls back to
+# `latest`, so pin those explicitly. Mind the slash rule while you do: a bare
+# `busybox` is read as *ours* and becomes <registry>/apps/busybox. To reach the
+# public one, spell it out — `docker.io/library/busybox`, with its own imageTag.
+#
+# Overriding from a second values file replaces this list wholesale — Helm
+# never merges lists element by element. Keep the whole list in one file.
+initContainers: []
+
 # --- services outside the cluster --------------------------------------------
 # Things running on the VM but not in Kubernetes — Postgres, Redis, anything in
 # the platform's Docker stack. Each entry becomes a selector-less Service plus a

@@ -52,12 +52,16 @@ means "our own app" and is expanded to <registry.host>/apps/<image>. Anything
 containing a slash is already a full reference — traefik/whoami, ghcr.io/x/y, or
 a spelled-out registry.matejkovac.sk/apps/nsr — and passes through untouched.
 */}}
-{{- define "app.imageRepository" -}}
-{{- if contains "/" .Values.image -}}
-{{- .Values.image -}}
+{{- define "app.expandImage" -}}
+{{- if contains "/" .image -}}
+{{- .image -}}
 {{- else -}}
-{{- printf "%s/apps/%s" .Values.registry.host .Values.image -}}
+{{- printf "%s/apps/%s" .root.Values.registry.host .image -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "app.imageRepository" -}}
+{{- include "app.expandImage" (dict "image" .Values.image "root" .) -}}
 {{- end -}}
 
 {{/*
@@ -72,8 +76,17 @@ nothing to detect from.
 {{- define "app.usePullSecret" -}}
 {{- if ne (toString .Values.registry.pullSecret) "" -}}
 {{- if .Values.registry.pullSecret -}}true{{- end -}}
-{{- else if and .Values.image (hasPrefix .Values.registry.host (include "app.imageRepository" .)) -}}
-true
+{{- else -}}
+{{- $ours := false -}}
+{{- if and .Values.image (hasPrefix .Values.registry.host (include "app.imageRepository" .)) -}}
+{{- $ours = true -}}
+{{- end -}}
+{{- range .Values.initContainers -}}
+{{- if and .image (hasPrefix $.Values.registry.host (include "app.expandImage" (dict "image" .image "root" $))) -}}
+{{- $ours = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $ours -}}true{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -84,4 +97,40 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{- define "app.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "app.name" . }}
+{{- end -}}
+
+{{/*
+An init container's name.
+
+Explicit `name` wins. Otherwise it is derived from the image's last path
+segment, so `nsr-migrate` becomes init-nsr-migrate and shows up that way in
+`kubectl logs` — characters a container name cannot hold are folded to dashes.
+*/}}
+{{- define "app.initContainerName" -}}
+{{- if .name -}}
+{{- .name -}}
+{{- else -}}
+{{- $seg := first (splitList ":" (last (splitList "/" .image))) -}}
+{{- printf "init-%s" (trimAll "-" (regexReplaceAll "[^a-z0-9-]" (lower $seg) "-")) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+An init container's full image reference.
+
+The repository expands by the same rule as the app's own `image`. The tag is the
+entry's own `imageTag` if it sets one; failing that, an image of *ours* rides the
+app's `imageTag`, because a migrate or seed image is built by the same pipeline
+and carries the same version. A third-party image has no such relationship, so
+it falls back to `latest` rather than being handed a version that only means
+something in our registry.
+*/}}
+{{- define "app.initImage" -}}
+{{- $root := .root -}}
+{{- $repo := include "app.expandImage" (dict "image" .container.image "root" $root) -}}
+{{- $tag := .container.imageTag -}}
+{{- if and (not $tag) (hasPrefix $root.Values.registry.host $repo) -}}
+{{- $tag = $root.Values.imageTag -}}
+{{- end -}}
+{{- printf "%s:%s" $repo (default "latest" $tag) -}}
 {{- end -}}

@@ -4,6 +4,16 @@
     {{- fail (printf "volume %q is ReadWriteOnce and cannot be attached to %d pods — set replicas: 1, or accessMode: ReadWriteMany with a storage class that supports it" $k (int $.Values.replicas)) }}
   {{- end }}
 {{- end }}
+{{- $initNames := list }}
+{{- range $i, $ic := .Values.initContainers }}
+  {{- if not $ic.image }}
+    {{- fail (printf "initContainers[%d] has no `image` — every init container needs one" $i) }}
+  {{- end }}
+  {{- $initNames = append $initNames (include "app.initContainerName" $ic) }}
+{{- end }}
+{{- if ne (len $initNames) (len (uniq $initNames)) }}
+  {{- fail (printf "two init containers resolve to the same name (%s) — set an explicit `name` on one of them" (join ", " $initNames)) }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -33,6 +43,54 @@ spec:
       {{- if include "app.usePullSecret" . }}
       imagePullSecrets:
         - name: {{ include "app.pullSecretName" . }}
+      {{- end }}
+      {{- if .Values.initContainers }}
+      # Each runs to completion, in the order written, before the app container
+      # starts; the first one to fail stops the pod there. They inherit the same
+      # envFrom, env and volume mounts as the app container, so a migration step
+      # reads the same DATABASE_URL out of the same synced Secret without being
+      # told about it twice.
+      initContainers:
+        {{- range $ic := .Values.initContainers }}
+        - name: {{ include "app.initContainerName" $ic }}
+          image: "{{ include "app.initImage" (dict "container" $ic "root" $) }}"
+          imagePullPolicy: {{ $ic.imagePullPolicy | default $.Values.imagePullPolicy }}
+          {{- with $ic.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $ic.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $.Values.secrets.enabled }}
+          envFrom:
+            - secretRef:
+                name: {{ include "app.secretName" $ }}
+          {{- end }}
+          {{- $env := mustMergeOverwrite (deepCopy (default (dict) $.Values.env)) (default (dict) $ic.env) }}
+          {{- with $env }}
+          env:
+            {{- range $k, $v := . }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- end }}
+          {{- with $ic.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $.Values.persistence }}
+          volumeMounts:
+            {{- range $key, $vol := $.Values.persistence }}
+            - name: {{ $key }}
+              mountPath: {{ required (printf "persistence.%s.mountPath is required" $key) $vol.mountPath }}
+              {{- with $vol.subPath }}
+              subPath: {{ . }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
       {{- end }}
       containers:
         - name: {{ include "app.name" . }}
