@@ -118,19 +118,39 @@ segment, so `nsr-migrate` becomes init-nsr-migrate and shows up that way in
 {{/*
 An init container's full image reference.
 
-The repository expands by the same rule as the app's own `image`. The tag is the
-entry's own `imageTag` if it sets one; failing that, an image of *ours* rides the
-app's `imageTag`, because a migrate or seed image is built by the same pipeline
-and carries the same version. A third-party image has no such relationship, so
-it falls back to `latest` rather than being handed a version that only means
-something in our registry.
+The repository expands by the same rule as the app's own `image`. The tag is
+looked for in three places, in this order:
+
+  initImageTags.<name>   written by that image's own pipeline, in its own file
+  the entry's imageTag   pinned by hand, typically a third-party image
+  the app's imageTag     an image of *ours* with neither of the above
+
+The first exists for a step released on its own cadence — a migrations
+repository carrying a schema version — where riding the app's tag would pin it
+to a version that means nothing in the registry it came from. It is keyed by the
+container's *resolved* name, so an entry with no `name` is keyed by the derived
+`init-<image>`.
+
+Setting both `initImageTags.<name>` and the entry's own `imageTag` is refused
+rather than resolved. That is the two-sources-of-truth the versions/ split
+exists to prevent, and silently picking one would make the quieter file win.
+
+An image of ours with no tag anywhere still rides the app's `imageTag`, because
+a migrate or seed image built by the same pipeline carries the same version. A
+third-party image has no such relationship and falls back to `latest`.
 */}}
 {{- define "app.initImage" -}}
 {{- $root := .root -}}
-{{- $repo := include "app.expandImage" (dict "image" .container.image "root" $root) -}}
-{{- $tag := .container.imageTag -}}
+{{- $ic := .container -}}
+{{- $repo := include "app.expandImage" (dict "image" $ic.image "root" $root) -}}
+{{- $name := include "app.initContainerName" $ic -}}
+{{- $pinned := index (default (dict) $root.Values.initImageTags) $name -}}
+{{- if and $pinned $ic.imageTag -}}
+{{- fail (printf "init container %q takes its tag from both initImageTags (%v) and its own imageTag (%v) — keep whichever one a pipeline writes and drop the other" $name $pinned $ic.imageTag) -}}
+{{- end -}}
+{{- $tag := default $ic.imageTag $pinned -}}
 {{- if and (not $tag) (hasPrefix $root.Values.registry.host $repo) -}}
 {{- $tag = $root.Values.imageTag -}}
 {{- end -}}
-{{- printf "%s:%s" $repo (default "latest" $tag) -}}
+{{- printf "%s:%s" $repo (toString (default "latest" $tag)) -}}
 {{- end -}}

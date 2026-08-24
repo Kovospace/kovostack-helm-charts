@@ -153,10 +153,36 @@ An init container pulled from our registry gets the `imagePullSecret` too, even
 when the app's own `image` is public.
 
 ⚠️ **A second values file replaces this list wholesale.** Helm never merges
-lists element by element, so `versions/<app>.yaml` cannot set one entry's
-`imageTag` without restating every entry. Keep the whole list in the app's
-values file and let the tags ride `imageTag`, which is a scalar and overrides
-cleanly.
+lists element by element, so `versions/<app>.yaml` cannot reach inside an entry
+to set its `imageTag` — it would have to restate every entry. Keep the whole
+list in the app's values file.
+
+#### A step with its own version
+
+Some init containers are not built by the app's pipeline and do not carry its
+version — a migrations repository publishing a schema version of its own. For
+those, `initImageTags` is a **map**, keyed by the container's name, and a map
+*does* merge across values files:
+
+```yaml
+# applications/<app>/values.yaml — edited by humans
+initContainers:
+  - name: migrations
+    image: new-tab-links-migrations
+
+# versions/<app>-init.yaml — written by the migrations pipeline
+initImageTags:
+  migrations: "1.2.3"
+```
+
+Both version files load after the app's values and neither overwrites the other,
+because `imageTag` and `initImageTags` are different keys. The key is the
+container's *resolved* name: `migrations` above, but `init-nsr-seed` for an
+entry that sets no `name`. Quote the value — an unquoted `1.2` is a YAML float.
+
+Setting `initImageTags.<name>` and that entry's own `imageTag` is refused rather
+than resolved, for the same reason `imageTag` lives only in `versions/`: two
+sources of truth where the quieter one always wins.
 
 Init containers render only when `image` is set — no Deployment, no init
 containers.

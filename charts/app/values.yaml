@@ -83,6 +83,31 @@ healthPath: ""
 # never merges lists element by element. Keep the whole list in one file.
 initContainers: []
 
+# Tags for init container images that are released on their own cadence, keyed
+# by the container's name — the entry's `name`, or the derived `init-<image>`
+# when it has none:
+#
+#   initContainers:
+#     - name: migrations
+#       image: new-tab-links-migrations
+#
+#   initImageTags:
+#     migrations: "1.2.3"
+#
+# The point of the map is that a *list* cannot be patched from a second values
+# file and a map can. So this tag can live in its own file under versions/,
+# written by that image's pipeline, while the list above stays where humans edit
+# it. It is a different key from `imageTag`, so the two version files merge
+# instead of the later one overwriting the app's tag.
+#
+# Reach for it when a step's image has its own version that is not the app's — a
+# migrations repository publishing a schema version. A migrate image built by
+# the app's own pipeline needs nothing here: it already rides `imageTag`.
+#
+# Setting a tag here *and* an `imageTag` on the same entry is refused rather
+# than resolved. Quote the value — an unquoted 1.2 is a YAML float, not a tag.
+initImageTags: {}
+
 # --- services outside the cluster --------------------------------------------
 # Things running on the VM but not in Kubernetes — Postgres, Redis, anything in
 # the platform's Docker stack. Each entry becomes a selector-less Service plus a
