@@ -80,6 +80,87 @@ Both names serve the app directly; neither redirects to the other. Search
 engines treat them as duplicate content, so pick one as canonical in the app
 itself, or add a Traefik redirect middleware.
 
+## Init containers
+
+Steps that must finish before the app starts — a migration, a seed, waiting on
+a dependency. `initContainers` is a **list**, and Kubernetes runs the entries
+one at a time in the order written; the first failure stops the pod there.
+
+```yaml
+name: nsr
+image: nsr
+imageTag: v2.4.1
+
+initContainers:
+  - image: docker.io/library/busybox
+    imageTag: "1.36"
+    command: ["sh", "-c", "until nc -z postgres 5432; do sleep 1; done"]
+  - image: nsr-migrate
+    command: ["./manage.py", "migrate"]
+  - image: nsr-seed
+```
+
+renders three init containers that run in exactly that order, then the app.
+
+Only `image` is required per entry. `name` defaults to `init-<last path segment
+of image>` — the middle entry above becomes `init-nsr-migrate`, which is what
+`kubectl logs` wants from you. `command`, `args`, `env`, `resources` and
+`imagePullPolicy` behave as they do on the app container.
+
+**It is a list and not a map on purpose.** `persistence` and `externalServices`
+are maps because their entries are unordered; Helm iterates map keys in sorted
+order, so a map here would quietly run your seed before your migration.
+
+### Where the parameters come from
+
+Every entry inherits, without repeating any of it:
+
+| | inherited from |
+|---|---|
+| `envFrom` | the app's synced Secret — every key in its Infisical folder |
+| `env` | the chart's `env:`, overridable per entry |
+| `volumeMounts` | the same `persistence:` volumes, at the same paths |
+
+So a migration reads the same `DATABASE_URL` as the app *by construction*,
+whether that value comes from `env:` in the gitops repo or from Infisical. There
+is no second place to wire it, and no way for the two to drift.
+
+A per-entry `env` wins over the shared one for that container only:
+
+```yaml
+env:
+  LOG_LEVEL: info           # app and every init container
+
+initContainers:
+  - image: nsr-seed
+    env:
+      LOG_LEVEL: debug      # this container only
+```
+
+### Tags
+
+An entry with no `imageTag` that resolves to **our** registry rides the app's
+`imageTag`, because a migrate image is built by the same pipeline and carries
+the same version — so one bump in `versions/<app>.yaml` moves the app and its
+migration together. In the example above, `nsr-migrate` and `nsr-seed` both
+resolve to `v2.4.1`.
+
+An image from anywhere else falls back to `latest`, so pin it. Watch the slash
+rule while you do: a bare `busybox` is read as *ours* and becomes
+`<registry>/apps/busybox`. The public one is `docker.io/library/busybox`.
+
+An init container pulled from our registry gets the `imagePullSecret` too, even
+when the app's own `image` is public.
+
+⚠️ **A second values file replaces this list wholesale.** Helm never merges
+lists element by element, so `versions/<app>.yaml` cannot set one entry's
+`imageTag` without restating every entry. Keep the whole list in the app's
+values file and let the tags ride `imageTag`, which is a scalar and overrides
+cleanly.
+
+Init containers render only when `image` is set — no Deployment, no init
+containers.
+
 ## Secrets
 
 Everything in the app's Infisical folder is synced into one Secret and mounted

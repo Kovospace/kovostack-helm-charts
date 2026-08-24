@@ -62,6 +62,70 @@ ignored, so nothing will tell you it was wrong:
 helm template test charts/app --set name=test --set image=nginx
 ```
 
+## The chart agent
+
+`helm-chart-devops` is a Claude Code subagent that owns chart edits: it makes the
+change, bumps `version:` in that chart's `Chart.yaml`, renders it, and delivers
+the result as a PR from an `upgrade/**` branch. It never pushes to `main` and
+never tags — tagging stays the human release step above.
+
+```
+.claude/agents/helm-chart-devops.md    the agent (symlinked into ~/.claude/agents/)
+.claude/hooks/branch-guard.sh          PreToolUse hook enforcing the branch rule
+.claude/settings.json                  wires the hook up for this repo
+```
+
+### Bump size
+
+| | when |
+|---|---|
+| patch | fix, refactor, docs — nothing an existing app renders changes shape |
+| minor | new value, new template, new switch, changed default |
+| major | never — the agent stops and asks, because every pinned Application would need coordinated attention |
+
+### Triggering it from another project
+
+The agent is symlinked into `~/.claude/agents/`, so it is available from every
+repository on this machine, not just this one. From an app repo or from
+`kovostack-infra-gitops`:
+
+```
+> use the helm-chart-devops agent to add a nodeSelector value to charts/app
+```
+
+or non-interactively, from a script or CI step in that project:
+
+```bash
+claude -p "Use the helm-chart-devops subagent: charts/app needs a nodeSelector value"
+```
+
+It resolves this repository itself — `$KOVOSTACK_CHARTS_REPO` if set, otherwise
+`/home/kovo/IdeaProjects/kovostack-helm-charts`, otherwise a fresh clone — so the
+calling project's own files are never touched. For the first two to work, the
+calling project has to let the agent out of its own directory:
+
+```json
+// <other-project>/.claude/settings.json
+{ "permissions": { "additionalDirectories": ["/home/kovo/IdeaProjects/kovostack-helm-charts"] } }
+```
+
+Without that, the agent clones instead, and the branch it pushes is still the
+deliverable — only the local checkout differs.
+
+### The branch guard
+
+`branch-guard.sh` is a `PreToolUse` hook on `Bash`. It parses the command,
+resolves which remote the push is aimed at, and denies anything landing outside
+`upgrade/**` in this repository — `main`, a tag, `--tags`, `--all`, `--mirror`,
+`HEAD:main`, a deletion, or a bare `git push` while on `main`. It resolves the
+remote first and exits silently for every other repository, which is why it is
+safe to install in `~/.claude/settings.json` as well as here — that global copy
+is what keeps the rule in force when the agent is triggered from another project,
+since a project's own settings do not travel with it.
+
+It guards a human's `git push` in this repo too. That is deliberate: `main` moves
+by PR merge, and tags are cut from `main` afterwards.
+
 ## Access
 
 ArgoCD needs read access to this repository, and a GitHub deploy key can only be
