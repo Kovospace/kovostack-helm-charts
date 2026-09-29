@@ -113,16 +113,21 @@ spec:
               value: {{ $v | quote }}
             {{- end }}
           {{- end }}
-          {{- if .Values.healthPath }}
+          {{- /* Each probe falls back to healthPath, so an app that sets only that renders as before. */}}
+          {{- $readinessPath := .Values.readinessPath | default .Values.healthPath }}
+          {{- $livenessPath := .Values.livenessPath | default .Values.healthPath }}
+          {{- if $readinessPath }}
           readinessProbe:
             httpGet:
-              path: {{ .Values.healthPath }}
+              path: {{ $readinessPath }}
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+          {{- end }}
+          {{- if $livenessPath }}
           livenessProbe:
             httpGet:
-              path: {{ .Values.healthPath }}
+              path: {{ $livenessPath }}
               port: http
             initialDelaySeconds: 15
             periodSeconds: 20

@@ -54,6 +54,24 @@ web deployment:
   anything with no public route.
 - **`secrets.enabled: false`** → no ExternalSecret, for an app with no secrets.
 
+## Health probes
+
+`healthPath` alone gives both probes the same path, which suits an app with one
+health endpoint. An app that can tell the two questions apart should:
+
+```yaml
+healthPath: /actuator/health                   # kept as the fallback
+readinessPath: /actuator/health/readiness      # "send me traffic?"
+livenessPath: /actuator/health/liveness        # "am I stuck?" - restarts the container
+```
+
+The difference matters as soon as a health check includes a dependency. With one
+path for both, a database outage fails liveness on every replica at once and
+Kubernetes restarts them all - which fixes nothing, since the database is still
+down, and turns an outage into a crash loop. Liveness should fail only for
+something a restart cures. Each of the two falls back to `healthPath`, and a
+probe with no path at all is not rendered.
+
 ## Serving www as well
 
 `wwwAlias: true` adds `www.<host>` as a second rule on the Ingress and a second
