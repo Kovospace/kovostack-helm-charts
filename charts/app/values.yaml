@@ -36,6 +36,16 @@ resources: {}
 # defaulting to "/", which would mark apps healthy that merely 404.
 healthPath: ""
 
+# Separate paths for the two probes, each falling back to healthPath. They
+# answer different questions, and one path for both is what turns a database
+# blip into every replica restarting at once:
+#   readiness - "send me traffic?"  A failure takes the pod out of the Service.
+#   liveness  - "am I stuck?"       A failure restarts the container, so it must
+#                                   not depend on anything a restart cannot fix.
+# Spring Boot: /actuator/health/readiness and /actuator/health/liveness.
+readinessPath: ""
+livenessPath: ""
+
 # --- init containers ---------------------------------------------------------
 # Steps that must finish before the app container starts — a database
 # migration, a seed, waiting on a dependency. Kubernetes runs them one at a
