@@ -12,3 +12,19 @@ metadata:
   annotations:
     # Before the workload and the ExternalSecret that land inside it.
     argocd.argoproj.io/sync-wave: "-5"
+    # Delete=false on the PVCs alone does not keep them. Deleting the
+    # Application skips the claims, but then deletes this Namespace — and
+    # Kubernetes deletes everything inside a Namespace with it, claims included.
+    # That is how kovo-old came back on empty volumes: the annotation on the
+    # PVCs was honoured, and the namespace took them anyway.
+    #
+    # So the Namespace is left behind too. Deleting the Application removes the
+    # workload, Service, Ingress, ExternalSecrets and the rest; the Namespace and
+    # its PVCs stay until someone deletes them on purpose
+    # (`kubectl delete namespace <name>`).
+    #
+    # Delete=false, not Prune=false, for the same reason as in pvc.yaml:
+    # Prune=false leaves the app OutOfSync forever over a resource it was told
+    # never to remove, and blocks every later sync. Delete=false only applies
+    # when the Application itself is deleted; normal pruning is untouched.
+    argocd.argoproj.io/sync-options: Delete=false
