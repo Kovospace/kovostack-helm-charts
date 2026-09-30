@@ -150,7 +150,8 @@ externalServices: {}
 #       mountPath: /app/uploads
 #
 # Per entry: size and mountPath are required; storageClass, accessMode (default
-# ReadWriteOnce) and subPath are optional.
+# ReadWriteOnce) and subPath are optional. `backup: false` leaves the volume out
+# of `backup:` below — scratch space, caches, anything re-derivable.
 #
 # Class for app volumes. local-path-retain keeps the data on disk when a PVC is
 # deleted, unlike k3s' stock local-path which deletes it with the claim. Set to
@@ -240,3 +241,155 @@ secrets:
     # not the credential itself. Created by hand at bootstrap.
     credentialsSecret: infisical-credentials
     credentialsNamespace: external-secrets
+# --- backup -----------------------------------------------------------------
+# Off by default. Switched on, it renders K8up (k8up.io/v1) objects that back up,
+# every night, to each destination below:
+#
+#   volumes    every `persistence` entry, file by file (opt one out with
+#              `persistence.<key>.backup: false`)
+#   sqlite     a consistent snapshot of each file in `sqlite.files`
+#   postgres   a pg_dump of the app's database, over `externalServices`
+#
+# Any combination works: volumes only, volumes + sqlite, volumes + postgres, or
+# postgres alone for an app with no volumes. Rendering fails if backup is on
+# and there is nothing to back up. Needs the K8up operator and its CRDs in the
+# cluster. See the README for restoring.
+backup:
+  enabled: false
+
+  # Where snapshots go. A *map*, so a second destination is one more entry in a
+  # values file rather than a restatement of the first — maps merge across
+  # values files, lists do not. Each enabled entry gets its own Schedule, its
+  # own credentials Secret and its own dump pods, so destinations never share a
+  # run.
+  #
+  # The repository for this app is <url>/<name>/ — one restic repository per
+  # app, so a dev instance (new-tab-links-backend-dev) never mixes with prod.
+  #
+  # Credentials come through `store`, a ClusterSecretStore owned by the infra
+  # repo and scoped to the backup folder alone (Infisical /backup for the
+  # gateway). This chart only references it by name — rendering it here would
+  # give one cluster-scoped object as many owners as there are apps. Keys:
+  #   usernameKey/passwordKey   the REST server's HTTP basic auth
+  #   repoPasswordKey           restic's repository encryption password
+  # K8up splices the basic-auth pair into the repository URL unescaped, so the
+  # REST username and password must be alphanumeric.
+  #
+  # statsURL (optional, empty = none) is passed to the Schedule; K8up POSTs
+  # backup stats to it.
+  #
+  # Adding the home Raspberry Pi later is one entry, e.g.:
+  #   destinations:
+  #     pi:
+  #       url: http://192.168.1.20:8000
+  #       store: infisical-backup-pi
+  #
+  # Per destination, `schedule` may override the one below key by key, and
+  # `retention` replaces it as a whole. `enabled: false` switches one off
+  # without deleting it. usernameKey, passwordKey and repoPasswordKey default
+  # to the names shown, so a new destination needs only url and store.
+  destinations:
+    gateway:
+      url: http://restic-gateway.backup.svc.cluster.local:8080
+      store: infisical-backup
+      usernameKey: RESTIC_REST_USERNAME
+      passwordKey: RESTIC_REST_PASSWORD
+      repoPasswordKey: RESTIC_PASSWORD
+      statsURL: ""
+
+  # Cron expressions, read in the K8up operator's time zone (Europe/Bratislava
+  # on this cluster). Empty = a slot derived from the app and destination name:
+  # backup nightly at 00:xx, 01:xx, 03:xx or 04:xx, check on Wednesdays and
+  # prune on Sundays four hours later. So apps spread out over the night instead
+  # of all hitting the gateway at once, and a prune does not collide with the
+  # backup it is pruning. 02:xx is avoided: on DST change days it runs twice or
+  # not at all — keep overrides out of it too. K8up's own @daily-random etc. are
+  # accepted, but spread over all 24 hours.
+  # Overriding only `backup` leaves check and prune on their derived slots, so
+  # move those too if the new backup time comes near them.
+  schedule:
+    backup: ""
+    check: ""
+    prune: ""
+
+  # restic forget --keep-*. Any of keepLast, keepHourly, keepDaily, keepWeekly,
+  # keepMonthly, keepYearly, keepTags. Replaced as a whole per destination.
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+    keepMonthly: 6
+
+  # Default statsURL for destinations that set none.
+  statsURL: ""
+
+  # Finished K8up jobs to keep around for `kubectl logs`, per job type.
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+
+  # A live SQLite file cannot be copied safely: a copy taken mid-write restores
+  # as a corrupt database, silently. List each database here — the path the app
+  # sees, the same one as in its DATABASE_URI — and a dump pod snapshots it with
+  # `VACUUM INTO` (one consistent read transaction, safe while the app writes),
+  # integrity-checks the copy, and streams it into the snapshot as
+  # /<name>-sqlite.tar. The live files (and
+  # their -wal/-shm/-journal) are left out of the file-level volume backup.
+  #
+  #   sqlite:
+  #     files:
+  #       - /app/data/nsr.db
+  #
+  # Each file must sit under a `persistence` mountPath. The dump pod mounts that
+  # volume at the same path, alongside the running app — SQLite's own locking
+  # makes that safe on a node-local volume.
+  sqlite:
+    files: []
+    # Anything with sqlite3, sh and tar. Taken as written, not expanded like
+    # `image`.
+    image: docker.io/keinos/sqlite3
+    imageTag: "3.53.4"
+    resources:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits:   {memory: 256Mi}
+
+  # pg_dump of the app's database, for Postgres outside the cluster. The dump
+  # pod gets the app's own environment — its synced Secret via envFrom and
+  # everything in `env:` — so it connects exactly as the app does, through the
+  # same `externalServices` name. You say which of those variables hold what:
+  #
+  #   urlEnv       a URL: postgres://, postgresql:// or jdbc:postgresql://
+  #                (jdbc: and its ?query are stripped; credentials in a
+  #                postgres:// URL are used as they are)
+  #   hostEnv, portEnv, databaseEnv, userEnv, passwordEnv
+  #                the parts, each overriding what the URL does not carry
+  #   env          literal PG* variables, for what the app has nowhere, e.g.
+  #                {PGDATABASE: scraper}
+  #
+  #   Spring:   urlEnv: SPRING_DATASOURCE_URL
+  #             userEnv: SPRING_DATASOURCE_USERNAME
+  #             passwordEnv: SPRING_DATASOURCE_PASSWORD
+  #   Payload:  urlEnv: DATABASE_URI
+  #
+  # A variable that is named here but empty in the pod fails the backup rather
+  # than dumping with a default.
+  postgres:
+    enabled: false
+    urlEnv: ""
+    hostEnv: ""
+    portEnv: ""
+    databaseEnv: ""
+    userEnv: ""
+    passwordEnv: ""
+    env: {}
+    # plain -> /<name>-postgres.sql, restored with psql; deduplicates well.
+    # custom -> /<name>-postgres.dump, restored with pg_restore (selective).
+    format: plain
+    extraArgs: []
+    # The client's major version must be at least the server's: pg_dump
+    # refuses a newer server. The platform's Postgres is 17, and a matching
+    # major is the safe choice, since a newer pg_dump's output is only
+    # guaranteed to load into a server at least as new as itself.
+    image: docker.io/library/postgres
+    imageTag: "17.11-alpine"
+    resources:
+      requests: {cpu: 10m, memory: 64Mi}
+      limits:   {memory: 512Mi}
