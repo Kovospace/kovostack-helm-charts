@@ -53,6 +53,8 @@ web deployment:
 - **`host` empty** → no Ingress or certificate. For workers, cron jobs and
   anything with no public route.
 - **`secrets.enabled: false`** → no ExternalSecret, for an app with no secrets.
+- **`backup.enabled: true`** → K8up Schedule, dump pods and backup credentials;
+  off by default. See [Backups](#backups).
 
 ## Health probes
 
@@ -373,9 +375,311 @@ Two caveats specific to this cluster, both from k3s' default `local-path`
 class:
 
 - **The data lives on one node's disk.** There is no replication and no
-  snapshot. Anything here needs its own backup — the cluster is not one.
+  snapshot. Anything here needs its own backup — the cluster is not one. See
+  [Backups](#backups).
 - **No `allowVolumeExpansion`.** Growing a volume later means creating a new
   claim and copying, so size with headroom now.
+
+## Backups
+
+Off by default. `backup.enabled: true` renders [K8up](https://k8up.io)
+(`k8up.io/v1`, written against operator **v2.16.0** / chart 4.10.0) objects
+that back the app up every night to a restic repository of its own,
+`<url>/<name>/`. With the default destination, that is
+`rest:http://restic-gateway.backup.svc.cluster.local:8080/<name>/`, the gateway
+in front of the Hetzner Storage Box. A dev instance such as
+`new-tab-links-backend-dev` gets its own repository by virtue of its own
+`name`.
+
+Three things can be backed up, in any combination:
+
+| | how | lands in the snapshot as |
+|---|---|---|
+| **volumes** | every `persistence` entry, file by file | `/data/<name>-<key>/…`, one snapshot per volume |
+| **sqlite** | `VACUUM INTO` in a dump pod, per file in `backup.sqlite.files` | `/<name>-sqlite.tar` |
+| **postgres** | `pg_dump` in a dump pod, over `externalServices` | `/<name>-postgres.sql` (or `.dump`) |
+
+Rendering fails if backup is on and there is nothing to back up. Every snapshot
+carries the namespace (= `<name>`) as its restic host.
+
+### The four shapes
+
+```yaml
+# Volumes only — an app with uploads and no database.
+backup:
+  enabled: true
+persistence:
+  cache:
+    backup: false          # opt a scratch volume out; everything else is in
+```
+
+```yaml
+# Volumes + SQLite — nsr, roulage, kovo-old, istatdb.
+backup:
+  enabled: true
+  sqlite:
+    files:
+      - /app/data/nsr.db   # the path the app sees, as in DATABASE_URI
+```
+
+```yaml
+# Volumes + Postgres — kovo (Payload keeps one URL with credentials in it).
+backup:
+  enabled: true
+  postgres:
+    enabled: true
+    urlEnv: DATABASE_URI
+```
+
+```yaml
+# Postgres only — new-tab-links-backend (Spring; no volumes).
+backup:
+  enabled: true
+  postgres:
+    enabled: true
+    urlEnv: SPRING_DATASOURCE_URL          # jdbc:postgresql://postgres:5432/newtablinks
+    userEnv: SPRING_DATASOURCE_USERNAME
+    passwordEnv: SPRING_DATASOURCE_PASSWORD
+```
+
+paster-backend and music-pages-scraper-backend name their credentials
+`SPRING_DATASOURCE_USER` / `SPRING_DATASOURCE_PASS` in Infisical, so they set
+`userEnv`/`passwordEnv` to those. paster-backend would also set
+`persistence.temp.backup: false`. The mapping is per app because
+the names are; the chart does not guess.
+
+### What gets rendered
+
+Per enabled destination `<dest>` (default: `gateway`):
+
+| object | name | purpose |
+|---|---|---|
+| `ExternalSecret` | `<name>-backup-<dest>` | the REST credentials and restic password, from the destination's `store` |
+| `Schedule` | `<dest>` | daily backup, weekly check, weekly prune with retention |
+| `PreBackupPod` | `sqlite-<dest>`, `postgres-<dest>` | the dump pods, only when sqlite / postgres is on |
+
+plus one `ConfigMap` `<name>-backup-scripts` holding the dump scripts, and two
+annotations on each PVC. The K8up objects have short names on purpose. The
+namespace already says which app, and K8up derives Backup, Job and Pod names
+from them, truncating at 63 characters.
+
+A `PreBackupPod` is only a template. K8up turns it into a Deployment when a
+backup starts, execs the dump script in it, streams stdout into restic and
+deletes it again.
+
+### Which volumes are backed up
+
+K8up's own rule, with the operator's `skipWithoutAnnotation: false`, is *every*
+RWO/RWX PVC in the namespace unless it is annotated `k8up.io/backup: "false"`.
+The chart does not leave that to chance, in either direction:
+
+- **Every chart PVC is annotated explicitly**: `"true"`, or `"false"` for a
+  `persistence` entry with `backup: false`. The answer is the same however the
+  operator is configured.
+- **The Schedule selects by label.** Its `labelSelectors` match only objects
+  with this app's `app.kubernetes.io/name`. A PVC something else created in the
+  namespace (an app whose workload comes from its own chart, say) is not picked
+  up unless it carries that label.
+- A second selector matches **only this destination's** `PreBackupPod`s (label
+  `app.kovostack/backup-destination: <dest>`). Without it, two destinations'
+  backups would share one dump Deployment, and whichever finished first would
+  delete it under the other.
+
+ReadWriteOnce is handled by K8up. The backup Job is pinned to the node where the
+claim is mounted, and on this single-node cluster that is always the node
+anyway. Volumes are mounted read-only into the backup Job.
+
+With the annotations unset (`backup` off), the rendered PVCs are byte-identical
+to what they were before this feature.
+
+### Destinations, credentials and a second target
+
+`backup.destinations` is a **map**, so adding one is a values change and not a
+chart change. Maps merge across values files; lists would not. Each enabled
+entry gets its own Schedule, Secret and dump pods. The home Raspberry Pi,
+once it exists, is one entry:
+
+```yaml
+backup:
+  destinations:
+    pi:
+      url: http://192.168.1.20:8000     # restic rest-server; repo = <url>/<name>/
+      store: infisical-backup-pi        # a store scoped to the Pi's credentials
+      retention: {keepDaily: 14, keepMonthly: 12}
+```
+
+`gateway: {enabled: false}` turns the default one off without deleting it.
+`statsURL` (per destination, or `backup.statsURL`) is optional and empty by
+default; when set it is passed to the Schedule.
+
+**Credentials** come through `store`, a `ClusterSecretStore` that the **infra
+repo owns** (`infisical-backup`, scoped to Infisical `/backup`, non-recursive).
+The chart only references it by name, for two reasons:
+
+- Not the shared `infisical` store. It is rooted at `/` and flattens the whole
+  project by key name, so a `RESTIC_PASSWORD` anywhere else would collide (see
+  [Why each app gets its own store](#why-each-app-gets-its-own-store)).
+- Not a store rendered here. Every app's release would render the same
+  cluster-scoped object, and ArgoCD would fight over who owns it.
+
+The chart refuses a destination that points at either of those.
+
+The keys are `RESTIC_REST_USERNAME`, `RESTIC_REST_PASSWORD` (the REST server's
+basic auth) and `RESTIC_PASSWORD` (repository encryption, shared by all apps).
+Each can be renamed per destination with `usernameKey`, `passwordKey` and
+`repoPasswordKey`.
+
+⚠️ **The REST username and password must be alphanumeric.** K8up builds
+`rest:http://$(USER):$(PASSWORD)@host/…` without escaping, so an `@`, `:`, `/`,
+`%`, `?` or `#` in either silently produces a different URL.
+
+⚠️ **Losing `RESTIC_PASSWORD` loses every backup.** The repositories are
+encrypted with it and nothing else can open them. Keep a copy outside Infisical
+and outside the cluster.
+
+### Schedule
+
+Empty `schedule.*` means a slot derived from `<name>/<dest>`. It is stable
+across renders, so there is no ArgoCD drift, and different per app, so the
+gateway and the Storage Box's connection limit do not get every app at once:
+
+- backup daily at `00:xx`, `01:xx`, `03:xx` or `04:xx`;
+- check on Wednesdays and prune on Sundays, four hours after that.
+
+Cron is read in the operator's time zone, **Europe/Bratislava**. `02:xx` is
+skipped because on DST change days it happens twice or not at all. Keep
+overrides out of it too. Overriding only `backup` leaves check and prune on
+their derived slots, so move those as well if they end up close.
+
+Retention defaults to `keepDaily: 7, keepWeekly: 4, keepMonthly: 6`. A
+destination's own `retention` replaces it as a whole.
+
+### SQLite: why a dump pod, and the caveats
+
+A live SQLite file cannot be copied safely. A copy taken mid-write restores as
+a corrupt database, and nothing says so until the restore. So:
+
+- Each file in `backup.sqlite.files` is snapshotted with `VACUUM INTO`, which
+  writes the database as of one read transaction, taking SQLite's own locks
+  alongside the running app. The copy is then `PRAGMA integrity_check`ed, and a
+  failure fails the backup.
+- **Not `.backup`.** The shell's online backup copies in steps and restarts
+  whenever another connection writes in between. Against a busy app it never
+  finishes; that was reproduced while building this.
+- The dump pod mounts the volume at the **same path and subPath** as the app,
+  so the paths in `files` are the app's own. A path on no volume is refused.
+- It runs with a pinned `keinos/sqlite3` image (the app images may not contain
+  `sqlite3`) **as root**, so it can read a database owned by any uid. Running
+  as root, SQLite chowns any `-wal`/`-shm` it creates to the database owner, so
+  the app is never locked out of its own files. That is what the `CHOWN`
+  capability is kept for; all others except `DAC_OVERRIDE` and `FOWNER` are
+  dropped.
+- SQLite's locking only works between processes on the **same kernel**. That
+  holds for node-local volumes (`local-path`, this cluster). It would not over
+  NFS.
+- The live file and its `-wal`, `-shm` and `-journal` are **excluded from the
+  volume backup** (`k8up.io/backup-restic-args`). A torn copy is worse than
+  none. A stale `-wal` restored next to a good database gets replayed into it
+  and corrupts it.
+- The snapshot in the tar is in rollback-journal mode and owned by root.
+  Restore it as described below.
+
+### Postgres: how it connects, and the caveats
+
+The dump pod gets the app's own environment: its synced Secret via `envFrom`
+and everything in `env:`. It connects the way the app does, through the
+`externalServices` name (`postgres` → 172.17.0.1). You name the variables:
+
+| value | meaning |
+|---|---|
+| `urlEnv` | a URL: `postgres://`, `postgresql://` or `jdbc:postgresql://`. For JDBC, `jdbc:` and the `?query` are stripped (JDBC parameters are not libpq's). Credentials inside a `postgres://` URL are used as they are |
+| `hostEnv`, `portEnv`, `databaseEnv`, `userEnv`, `passwordEnv` | the parts, exported as `PGHOST` … `PGPASSWORD` |
+| `env` | literal `PG*` variables for what the app has nowhere, e.g. `{PGDATABASE: scraper}` |
+
+A named variable that is empty or unset fails the backup. It never falls back
+to a default user or database. Names are validated at render time, since they
+end up in a shell script.
+
+- **The client's major version must be at least the server's.** pg_dump
+  refuses a server newer than itself. The platform's Postgres is **17**, so the
+  default client is the pinned `postgres:17.11-alpine`, overridable with
+  `backup.postgres.image`/`imageTag`. When the server is upgraded, raise this
+  in step. Keep the majors equal rather than going ahead: a newer pg_dump's
+  output is only guaranteed to load into a server at least as new as itself.
+- `format: plain` (default) gives SQL, restored with `psql`, which deduplicates
+  well in restic. `custom` gives a `pg_restore` archive, for selective restores.
+- The dump pod runs as uid 70 (postgres in the alpine image) with every
+  capability dropped.
+
+### Restoring
+
+Stop the writer first for anything that is a database. **Do it in git**: set
+`replicas: 0` in the app's values. A `kubectl scale` is undone by ArgoCD's
+self-heal within minutes. Uploads can be restored with the app running.
+
+**Plain restic CLI** works from anywhere that can reach the gateway, and needs
+nothing from K8up:
+
+```bash
+kubectl -n backup port-forward svc/restic-gateway 8080:8080 &
+export RESTIC_REPOSITORY=rest:http://<RESTIC_REST_USERNAME>:<RESTIC_REST_PASSWORD>@localhost:8080/<name>/
+export RESTIC_PASSWORD=<RESTIC_PASSWORD>          # from Infisical /backup
+
+restic snapshots                                   # one per volume + one per dump, per night
+restic ls latest --path /data/<name>-uploads       # browse a volume snapshot
+
+# a volume, into a local directory
+restic restore latest --path /data/<name>-uploads --target ./restore
+
+# SQLite: the tar holds the files at the paths the app sees
+restic dump latest --path /<name>-sqlite.tar /<name>-sqlite.tar | tar -x -C ./restore
+
+# Postgres: into a freshly created, empty database
+restic dump latest --path /<name>-postgres.sql /<name>-postgres.sql \
+  | docker exec -i postgres psql -v ON_ERROR_STOP=1 -U <user> -d <db>
+```
+
+A plain dump has no `DROP` statements. Restore into an empty database (drop and
+recreate it, owned by the app's user) rather than on top of the live one.
+
+**A K8up `Restore` object** writes a snapshot straight into a PVC, in-cluster.
+It picks the latest snapshot matching `paths` (or an explicit `snapshot` ID),
+and puts its contents at the claim's root:
+
+```yaml
+apiVersion: k8up.io/v1
+kind: Restore
+metadata:
+  name: uploads-2026-09-30
+  namespace: <name>
+spec:
+  paths: ["/data/<name>-uploads"]      # or: snapshot: <id from `restic snapshots`>
+  restoreMethod:
+    folder:
+      claimName: <name>-uploads        # or a fresh claim, to inspect before swapping
+  backend:
+    repoPasswordSecretRef: {name: <name>-backup-gateway, key: RESTIC_PASSWORD}
+    rest:
+      url: http://restic-gateway.backup.svc.cluster.local:8080/<name>/
+      userSecretRef:     {name: <name>-backup-gateway, key: RESTIC_REST_USERNAME}
+      passwordSecretReg: {name: <name>-backup-gateway, key: RESTIC_REST_PASSWORD}
+```
+
+Apply it by hand, since it is a one-off action and not desired state, then
+delete it once `kubectl -n <name> get restore` shows it finished. Pointed at
+`paths: ["/<name>-sqlite.tar"]`, the same object drops the tar into the claim.
+
+**After restoring a SQLite database**, with the app stopped:
+
+1. Delete any `<db>-wal`, `<db>-shm` and `<db>-journal` next to it. A stale WAL
+   is replayed into the restored file.
+2. Put the restored file in place.
+3. `chown` it to the app's uid, since the snapshot is owned by root.
+4. Start the app again.
+
+The restored file is in rollback-journal mode. An app that wants WAL normally
+sets it when it connects. If yours does not, run `PRAGMA journal_mode=WAL;`
+once.
 
 ## Local rendering
 

@@ -1,0 +1,343 @@
+{{- if .Values.backup.enabled }}
+{{- $name := include "app.name" . }}
+{{- $ns := include "app.namespace" . }}
+{{- $b := .Values.backup }}
+{{- $dests := include "app.backupDestinations" . | fromJsonArray }}
+{{- $sqlite := (include "app.sqliteFiles" . | fromJson).files }}
+{{- $pg := $b.postgres }}
+{{- $destLabel := include "app.backupDestinationLabel" . }}
+
+{{- if not $dests }}
+{{- fail "backup.enabled is true but every backup.destinations entry is disabled — there is nowhere to send a snapshot" }}
+{{- end }}
+{{- $volumes := list }}
+{{- range $k, $v := .Values.persistence }}
+{{- if include "app.backupVolume" (dict "root" $ "vol" $v) }}{{ $volumes = append $volumes $k }}{{ end }}
+{{- end }}
+{{- if not (or $volumes $sqlite $pg.enabled) }}
+{{- fail "backup.enabled is true but there is nothing to back up — no persistence volume, no backup.sqlite.files and backup.postgres.enabled is false" }}
+{{- end }}
+
+{{- /* ------------------------------------------------ postgres connection */}}
+{{- $pgVars := list }}
+{{- if $pg.enabled }}
+{{- if not (has $pg.format (list "plain" "custom")) }}
+{{- fail (printf "backup.postgres.format %q: use plain or custom" (toString $pg.format)) }}
+{{- end }}
+{{- range $field, $pgVar := dict "hostEnv" "PGHOST" "portEnv" "PGPORT" "databaseEnv" "PGDATABASE" "userEnv" "PGUSER" "passwordEnv" "PGPASSWORD" }}
+{{- with index $pg $field }}
+{{- $pgVars = append $pgVars (dict "pg" $pgVar "from" (include "app.backupEnvName" (dict "field" $field "value" .))) }}
+{{- end }}
+{{- end }}
+{{- if not (or $pg.urlEnv $pg.hostEnv (and $pg.env $pg.env.PGHOST)) }}
+{{- fail "backup.postgres.enabled needs to know where the database is — set urlEnv or hostEnv to the app's variable, or env.PGHOST" }}
+{{- end }}
+{{- range $pg.extraArgs }}
+{{- if contains "'" (toString .) }}
+{{- fail (printf "backup.postgres.extraArgs: %q contains a single quote" (toString .)) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- /* ------------------------------------------------------ dump scripts */}}
+{{- if or $sqlite $pg.enabled }}
+---
+# The commands K8up execs in the dump pods. Whatever they write to stdout is
+# streamed into restic as one file, /<namespace>-<container><fileExtension>;
+# everything else must go to stderr. A non-zero exit fails the whole backup,
+# which is the point — a dump that half-worked must not look like a backup.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-backup-scripts
+  namespace: {{ $ns }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+data:
+  {{- if $sqlite }}
+  sqlite-dump.sh: |
+    #!/bin/sh
+    # Consistent snapshots of {{ $name }}'s SQLite databases, as one tar on stdout.
+    #
+    # VACUUM INTO writes a copy of the database as of a single read transaction,
+    # taking the same locks the app does, while the app keeps running. A plain
+    # file copy does not, and can restore corrupt. Not `.backup`: the shell's
+    # online backup copies in steps and restarts whenever another connection
+    # writes in between, so against a busy app it may never finish.
+    set -eu
+    work=/work/snapshot
+    rm -rf "$work"
+    trap 'rm -rf "$work"' EXIT
+    snap() {
+      src=$1
+      dst=$work$1
+      [ -f "$src" ] || { echo "backup: $src does not exist" >&2; exit 1; }
+      mkdir -p "$(dirname "$dst")"
+      # Waits up to 60s for a writer to let go rather than failing on SQLITE_BUSY.
+      sqlite3 -cmd ".timeout 60000" "$src" "VACUUM INTO '$dst'" >&2
+      res=$(sqlite3 "$dst" "PRAGMA integrity_check;")
+      [ "$res" = ok ] || { echo "backup: snapshot of $src failed integrity_check: $res" >&2; exit 1; }
+      echo "backup: $src -> $(wc -c < "$dst") bytes, integrity ok" >&2
+    }
+    {{- range $sqlite }}
+    snap '{{ .path }}'
+    {{- end }}
+    # Paths inside the tar are the paths the app sees, e.g. .{{ (first $sqlite).path }}
+    tar -C "$work" -cf - .
+  {{- end }}
+  {{- if $pg.enabled }}
+  postgres-dump.sh: |
+    #!/bin/sh
+    # pg_dump of {{ $name }}'s database, on stdout. The pod carries the app's own
+    # environment, so this connects the way the app does.
+    set -eu
+    url=""
+    {{- with $pg.urlEnv }}
+    {{- $v := include "app.backupEnvName" (dict "field" "urlEnv" "value" .) }}
+    url="${ {{- $v }}:-}"
+    [ -n "$url" ] || { echo "backup: {{ $v }} is empty or unset in the app's env/Secret" >&2; exit 1; }
+    case "$url" in
+      # JDBC's parameters are not libpq's, so the query string goes too.
+      jdbc:*) url=${url#jdbc:}; url=${url%%\?*} ;;
+    esac
+    {{- end }}
+    {{- range $pgVars }}
+    {{ .pg }}="${ {{- .from }}:?backup: {{ .from }} is empty or unset in the app's env/Secret}"
+    export {{ .pg }}
+    {{- end }}
+    set -- --no-password --format={{ $pg.format }}{{ range $pg.extraArgs }} '{{ . }}'{{ end }}
+    if [ -n "$url" ]; then set -- "$@" --dbname="$url"; fi
+    echo "backup: pg_dump $(pg_dump --version | cut -d' ' -f3) of ${PGDATABASE:-the database in the URL}" >&2
+    exec pg_dump "$@"
+  {{- end }}
+{{- end }}
+
+{{- range $dest := $dests }}
+{{- $d := index $b.destinations $dest }}
+{{- $secret := printf "%s-backup-%s" $name $dest }}
+{{- $store := $d.store | default "infisical-backup" }}
+{{- if or (eq $store $.Values.secrets.store) (eq $store (include "app.storeName" $)) }}
+{{- fail (printf "backup.destinations.%s.store %q is not a backup store: the shared one is rooted at / and flattens the project by key name, the app's own one is scoped to its folder. Point it at a store scoped to the backup folder, e.g. infisical-backup" $dest $store) }}
+{{- end }}
+{{- $slot := include "app.backupSlot" (dict "root" $ "dest" $dest) | fromJson }}
+{{- $sched := mergeOverwrite (dict "backup" "" "check" "" "prune" "") (deepCopy (default (dict) $b.schedule)) (deepCopy (default (dict) $d.schedule)) }}
+{{- $retention := $d.retention | default $b.retention }}
+{{- $url := required (printf "backup.destinations.%s.url is required" $dest) $d.url }}
+{{- /* The contract's key names unless a destination says otherwise, so a new one needs only url and store. */}}
+{{- $usernameKey := $d.usernameKey | default "RESTIC_REST_USERNAME" }}
+{{- $passwordKey := $d.passwordKey | default "RESTIC_REST_PASSWORD" }}
+{{- $repoPasswordKey := $d.repoPasswordKey | default "RESTIC_PASSWORD" }}
+---
+# The credentials for destination `{{ $dest }}`, copied into the app's namespace
+# because K8up's jobs run there. Only the keys K8up needs, by name.
+#
+# The store is the infra repo's, not this chart's: `{{ $store }}` is scoped to
+# the backup folder alone, non-recursive. Not the shared `infisical` store the
+# registry credential uses — that one is rooted at `/`, recursive, and flattens
+# the whole project by key name, so a RESTIC_PASSWORD anywhere else would
+# collide with this one (see secretstore.yaml). And not rendered here per app:
+# a cluster-scoped object that every app's release rendered under one name
+# would have as many owners as there are apps, and ArgoCD would fight over it.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: {{ $secret }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "app.labels" $ | nindent 4 }}
+spec:
+  refreshInterval: {{ $.Values.secrets.refreshInterval }}
+  secretStoreRef:
+    name: {{ $store }}
+    kind: ClusterSecretStore
+  target:
+    name: {{ $secret }}
+    creationPolicy: Owner
+  data:
+    {{- range $key := uniq (list $usernameKey $passwordKey $repoPasswordKey) }}
+    - secretKey: {{ $key }}
+      remoteRef:
+        key: {{ $key }}
+    {{- end }}
+---
+# Named after the destination alone: the namespace already says which app, and
+# K8up derives Backup, Job and Pod names from this one, truncating at 63.
+apiVersion: k8up.io/v1
+kind: Schedule
+metadata:
+  name: {{ $dest }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "app.labels" $ | nindent 4 }}
+spec:
+  backend:
+    repoPasswordSecretRef:
+      name: {{ $secret }}
+      key: {{ $repoPasswordKey }}
+    rest:
+      # K8up prepends rest: and splices the credentials in:
+      #   rest:<scheme>://$(USER):$(PASSWORD)@<host>/{{ $name }}/
+      url: {{ printf "%s/%s/" (trimSuffix "/" $url) $name | quote }}
+      userSecretRef:
+        name: {{ $secret }}
+        key: {{ $usernameKey }}
+      # Sic — K8up's field really is spelled passwordSecretReg.
+      passwordSecretReg:
+        name: {{ $secret }}
+        key: {{ $passwordKey }}
+  backup:
+    schedule: {{ $sched.backup | default $slot.backup | quote }}
+    {{- with $d.statsURL | default $b.statsURL }}
+    statsURL: {{ . | quote }}
+    {{- end }}
+    successfulJobsHistoryLimit: {{ $b.successfulJobsHistoryLimit }}
+    failedJobsHistoryLimit: {{ $b.failedJobsHistoryLimit }}
+    # Without selectors K8up takes every PVC and every PreBackupPod in the
+    # namespace. These narrow it to:
+    #   1. the app's own objects (its PVCs) — anything carrying this chart's
+    #      name label and no destination label;
+    #   2. the dump pods of *this* destination only, so two destinations never
+    #      share — or tear down — one another's dump pod mid-run.
+    labelSelectors:
+      - matchLabels:
+          {{- include "app.selectorLabels" $ | nindent 10 }}
+        matchExpressions:
+          - key: {{ $destLabel }}
+            operator: DoesNotExist
+      - matchLabels:
+          {{- include "app.selectorLabels" $ | nindent 10 }}
+          {{ $destLabel }}: {{ $dest }}
+  check:
+    schedule: {{ $sched.check | default $slot.check | quote }}
+    successfulJobsHistoryLimit: {{ $b.successfulJobsHistoryLimit }}
+    failedJobsHistoryLimit: {{ $b.failedJobsHistoryLimit }}
+  prune:
+    schedule: {{ $sched.prune | default $slot.prune | quote }}
+    successfulJobsHistoryLimit: {{ $b.successfulJobsHistoryLimit }}
+    failedJobsHistoryLimit: {{ $b.failedJobsHistoryLimit }}
+    retention:
+      {{- toYaml $retention | nindent 6 }}
+
+{{- if $sqlite }}
+{{- $keys := list }}
+{{- range $sqlite }}{{ $keys = append $keys .key }}{{ end }}
+{{- $keys = uniq $keys | sortAlpha }}
+---
+# Lives only for the duration of a backup: K8up turns it into a Deployment,
+# waits for it, execs sqlite-dump.sh in it, and deletes it again.
+apiVersion: k8up.io/v1
+kind: PreBackupPod
+metadata:
+  name: sqlite-{{ $dest }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "app.labels" $ | nindent 4 }}
+    {{ $destLabel }}: {{ $dest }}
+spec:
+  backupCommand: /bin/sh /backup-scripts/sqlite-dump.sh
+  fileExtension: .tar
+  pod:
+    spec:
+      containers:
+        - name: sqlite
+          image: "{{ $b.sqlite.image }}:{{ $b.sqlite.imageTag }}"
+          command: ["/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"]
+          # Root, so it can read a database owned by whatever uid the app runs
+          # as. It does not leave root-owned files behind: running as root,
+          # SQLite chowns any -wal/-shm it creates to the database file's owner
+          # — which is what CHOWN is kept for. Without it the app could find
+          # itself locked out of its own database.
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+          {{- with $b.sqlite.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: backup-scripts
+              mountPath: /backup-scripts
+              readOnly: true
+            - name: work
+              mountPath: /work
+            {{- range $key := $keys }}
+            {{- $vol := index $.Values.persistence $key }}
+            # Same path and subPath as in the app, so the files are where
+            # backup.sqlite.files says they are.
+            - name: {{ $key }}
+              mountPath: {{ include "app.absPath" $vol.mountPath }}
+              {{- with $vol.subPath }}
+              subPath: {{ . }}
+              {{- end }}
+            {{- end }}
+      volumes:
+        - name: backup-scripts
+          configMap:
+            name: {{ $name }}-backup-scripts
+        - name: work
+          emptyDir: {}
+        {{- range $key := $keys }}
+        - name: {{ $key }}
+          persistentVolumeClaim:
+            claimName: {{ $name }}-{{ $key }}
+        {{- end }}
+{{- end }}
+
+{{- if $pg.enabled }}
+---
+apiVersion: k8up.io/v1
+kind: PreBackupPod
+metadata:
+  name: postgres-{{ $dest }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "app.labels" $ | nindent 4 }}
+    {{ $destLabel }}: {{ $dest }}
+spec:
+  backupCommand: /bin/sh /backup-scripts/postgres-dump.sh
+  fileExtension: {{ ternary ".sql" ".dump" (eq $pg.format "plain") }}
+  pod:
+    spec:
+      containers:
+        - name: postgres
+          image: "{{ $pg.image }}:{{ $pg.imageTag }}"
+          command: ["/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"]
+          securityContext:
+            runAsUser: 70
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          {{- if $.Values.secrets.enabled }}
+          # The app's own Secret, as the app gets it — this is where the
+          # credentials named in backup.postgres come from.
+          envFrom:
+            - secretRef:
+                name: {{ include "app.secretName" $ }}
+          {{- end }}
+          {{- $env := mustMergeOverwrite (deepCopy (default (dict) $.Values.env)) (deepCopy (default (dict) $pg.env)) }}
+          {{- with $env }}
+          env:
+            {{- range $k, $v := . }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- end }}
+          {{- with $pg.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: backup-scripts
+              mountPath: /backup-scripts
+              readOnly: true
+      volumes:
+        - name: backup-scripts
+          configMap:
+            name: {{ $name }}-backup-scripts
+{{- end }}
+{{- end }}
+{{- end }}

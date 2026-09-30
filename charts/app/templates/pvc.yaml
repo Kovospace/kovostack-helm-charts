@@ -26,6 +26,34 @@ metadata:
     # Application itself is deleted. Normal pruning still works, so removing a
     # volume from values.yaml removes the claim and the app stays Synced.
     argocd.argoproj.io/sync-options: Delete=false
+    {{- if $.Values.backup.enabled }}
+    {{- /*
+    Stated either way rather than left to K8up's default, so the answer does not
+    depend on how the operator is configured: with BACKUP_SKIP_WITHOUT_ANNOTATION
+    an unannotated claim is silently skipped, without it it is silently included.
+    */}}
+    {{- if include "app.backupVolume" (dict "root" $ "vol" $vol) }}
+    k8up.io/backup: "true"
+    {{- $pvc := printf "%s-%s" (include "app.name" $) $key }}
+    {{- $excludes := list }}
+    {{- range $f := (include "app.sqliteFiles" $ | fromJson).files }}
+    {{- if eq $f.key $key }}
+    {{- range $suffix := list "" "-wal" "-shm" "-journal" }}
+    {{- $excludes = concat $excludes (list "--exclude" (printf "/data/%s/%s%s" $pvc $f.rel $suffix)) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- with $excludes }}
+    # The live SQLite files are left out of the file-level copy: a copy taken
+    # mid-write restores corrupt, and a stale -wal next to a restored database
+    # is replayed into it. The consistent snapshot comes from the sqlite
+    # PreBackupPod instead — see backup.yaml.
+    k8up.io/backup-restic-args: {{ toJson . | squote }}
+    {{- end }}
+    {{- else }}
+    k8up.io/backup: "false"
+    {{- end }}
+    {{- end }}
 spec:
   accessModes:
     - {{ $vol.accessMode | default "ReadWriteOnce" }}
