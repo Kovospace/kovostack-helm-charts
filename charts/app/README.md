@@ -349,14 +349,30 @@ Three things the chart does on your behalf, all of them about not losing data:
   did succeed, two processes sharing one SQLite file corrupt it.
 - **`replicas > 1` is refused** with a ReadWriteOnce volume, at template time
   rather than as a pod stuck in `ContainerCreating`.
-- **`Delete=false` on every PVC**, so the claim is not swept up when the
-  Application itself is deleted. Normal pruning still works, so the app never
-  gets stuck OutOfSync.
+- **`Delete=false` on every PVC _and_ on the Namespace**, so deleting the
+  Application never deletes a claim. Both are needed: with the annotation on
+  the PVCs alone, ArgoCD skips the claims but still deletes the Namespace, and
+  Kubernetes deletes every PVC inside a Namespace along with it. Normal pruning
+  still works, so the app never gets stuck OutOfSync — which is why this is
+  `Delete=false` and not `Prune=false`.
+
+**Deleting the Application leaves the Namespace and its PVCs behind.** The
+Deployment, Service, Ingress, ExternalSecrets (and the Secrets they own) and
+the backup objects go; the Namespace and the claims stay, and so do the data.
+Recreating the Application picks them up again. Removing them is a deliberate,
+manual step:
+
+```bash
+kubectl delete namespace <name>    # takes every PVC in it with it
+```
+
+Removing a single volume from `persistence` is not affected: that is a prune,
+and the claim is deleted as usual.
 
 **What actually protects the data is the StorageClass, not the annotation.**
 `local-path-retain` sets `reclaimPolicy: Retain`, so deleting a PVC leaves the
 PV and the files on disk. That holds however the claim is removed — pruned by
-ArgoCD, deleted by hand, or lost with the namespace.
+ArgoCD, deleted by hand, or with the namespace when you delete it yourself.
 
 The limit worth knowing: a retained volume does **not** reattach automatically.
 Delete a PVC and recreate it and you get a fresh, empty volume; the old data
