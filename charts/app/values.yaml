@@ -393,3 +393,28 @@ backup:
     resources:
       requests: {cpu: 10m, memory: 64Mi}
       limits:   {memory: 512Mi}
+
+# --- extra objects ----------------------------------------------------------
+# Whole manifests rendered into this release as written — for what the chart
+# has no value for: an app's own database StatefulSet, a CronJob, a ConfigMap.
+# Each item is a map (the manifest) or a string (the manifest as YAML), one
+# object per item, and goes through `tpl` with the chart's root context, so it
+# can say {{ .Values.imageTag }}, {{ include "app.pullSecretName" . }} and so
+# on. Braces meant literally (a Go template for some other tool) must be
+# escaped: {{ "{{" }} .foo }}.
+#
+#   extraObjects:
+#     - apiVersion: batch/v1
+#       kind: CronJob
+#       metadata:
+#         name: updater
+#       spec: ...
+#
+# The chart adds a namespace (the app's) when an item has none, and nothing
+# else: no labels. It refuses cluster-scoped kinds other than Namespace and
+# ClusterSecretStore (all the `applications` AppProject permits), and refuses
+# `app.kubernetes.io/name: <name>` on pods and claims, which would put them
+# behind the app's Service and into its backup. See the README.
+#
+# A list: a second values file replaces it wholesale. Keep it in one file.
+extraObjects: []

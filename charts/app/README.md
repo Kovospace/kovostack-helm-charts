@@ -55,6 +55,8 @@ web deployment:
 - **`secrets.enabled: false`** → no ExternalSecret, for an app with no secrets.
 - **`backup.enabled: true`** → K8up Schedule, dump pods and backup credentials;
   off by default. See [Backups](#backups).
+- **`extraObjects`** → arbitrary extra manifests in the same release; empty by
+  default. See [Extra objects](#extra-objects).
 
 ## Health probes
 
@@ -696,6 +698,246 @@ delete it once `kubectl -n <name> get restore` shows it finished. Pointed at
 The restored file is in rollback-journal mode. An app that wants WAL normally
 sets it when it connects. If yours does not, run `PRAGMA journal_mode=WAL;`
 once.
+
+## Extra objects
+
+For what the chart has no value for, such as an app's own database
+StatefulSet or a CronJob next to the web Deployment, `extraObjects` renders
+whole manifests into the same release. The alternative was a second ArgoCD
+Application with a mini chart in the gitops repo, and that is what this
+replaces.
+
+```yaml
+extraObjects:
+  # a map: the manifest itself
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: '{{ .Values.name }}-settings'
+    data:
+      image: '{{ include "app.imageRepository" . }}:{{ .Values.imageTag }}'
+
+  # a string: the manifest as YAML
+  - |
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: {{ .Values.name }}-limits
+    data:
+      replicas: {{ .Values.replicas | quote }}
+```
+
+Default `[]`, which renders nothing. With it empty, every app's output is
+byte-identical to chart 1.7.0.
+
+### Templating
+
+Every item goes through `tpl` with the chart's root context, so it can read any
+value and call the chart's helpers:
+
+| use | for |
+|---|---|
+| `{{ .Values.name }}`, `{{ include "app.namespace" . }}` | the app's name and namespace (the same string) |
+| `{{ include "app.imageRepository" . }}:{{ .Values.imageTag }}` | the app's own image, expanded like `image` (bare name → `<registry.host>/apps/<image>`), at the tag CI writes to `versions/<app>.yaml` |
+| `{{ include "app.secretName" . }}` | `<name>-secrets`, the Secret synced from Infisical |
+| `{{ include "app.pullSecretName" . }}` | `<name>-registry`, the zot pull secret |
+| `{{ .Values.env.X }}` | a plain env var the app gets, so a sidecar workload reads the same value |
+
+These helper names are what an app's values may depend on, so they are kept
+stable like value names.
+
+The two forms are templated differently:
+
+- **A map** has each string in it (keys and values) rendered on its own. The
+  result is always a string: `port: '{{ .Values.containerPort }}'` becomes
+  `port: "8080"`, which a field expecting an integer rejects. Write literal
+  numbers in a map, and do not `| quote`, because the value is already a
+  string and you would get `'"8080"'`. Untemplated numbers and booleans keep
+  their types. A templated value can never inject YAML structure.
+- **A string** is one template, rendered as text and then parsed. Use it when a
+  number or boolean comes from a value, or for a block built with `range`/`if`.
+  Quote what must stay a string (`{{ .Values.imageTag | quote }}`).
+
+Wrap templated map values in single quotes (`'{{ … }}'`). A YAML value that
+starts with `{` is otherwise read as a flow map.
+
+**Braces meant literally**, such as a Go template for external-secrets or
+Prometheus, must be escaped, or Helm evaluates them:
+`'{{ "{{" }} .password }}'` renders `{{ .password }}`, and so does a raw
+string, ``{{`{{ .password }}`}}``.
+
+**Use one document per item.** A string holding two manifests separated by
+`---` is refused, so give each its own list item. A leading `---` is fine.
+
+⚠️ It is a list, so a second values file replaces it wholesale. Keep it in
+the app's `values.yaml`. The image tag still comes from `versions/<app>.yaml`
+through `{{ .Values.imageTag }}`, so a CI bump moves extra workloads with the
+app.
+
+### Namespace
+
+An item without `metadata.namespace` gets the app's namespace (`<name>`), set
+in the rendered manifest exactly as every other template in this chart sets it.
+The chart sets it explicitly rather than relying on ArgoCD's destination
+namespace, so that `helm template` shows where everything lands, and the
+namespace keeps following `name` even if an Application's destination were
+ever set differently. An explicit `metadata.namespace` is kept as written.
+
+Cluster-scoped kinds must not get a namespace, and an app may not create most
+of them. The `applications` AppProject (`clusters/production/projects.yaml` in
+the gitops repo) whitelists only **`Namespace`** and **`ClusterSecretStore`** as
+cluster-scoped kinds. So:
+
+- `Namespace` and `ClusterSecretStore` render without a namespace, and setting
+  one on them is refused;
+- the other common cluster-scoped kinds (`ClusterRole`, `ClusterRoleBinding`,
+  `CustomResourceDefinition`, `PersistentVolume`, `StorageClass`,
+  `ClusterIssuer`, webhooks, …) are refused at render time instead of
+  being silently namespaced and then rejected at sync;
+- a cluster-scoped kind the chart does not know (a CRD's) would be given a
+  namespace. The AppProject then refuses it at sync, so it does not pass
+  silently, but the failure appears in ArgoCD rather than at render time.
+
+### Labels
+
+**The chart adds no labels to extra objects.** They render with exactly the
+labels you give them.
+
+The chart's one label, `app.kubernetes.io/name: <name>`, is not a decoration
+here. It is the whole selector of the app's Service and Deployment, and of the
+backup Schedule's `labelSelectors`, which back up every PVC and dump pod that
+carries it. Stamping it onto extra objects would put a database pod behind the
+web Service and its data directory into the file-level backup. Adding it to the
+object's metadata only and not to pod templates would still catch a standalone
+PVC. So nothing is added, and the reverse is guarded too. The chart **refuses**
+`app.kubernetes.io/name: <name>` where those selectors look:
+
+- `metadata.labels` of a `Pod`, `PersistentVolumeClaim` or `PreBackupPod`;
+- `spec.template.metadata.labels` (Deployment, StatefulSet, DaemonSet, Job);
+- `spec.jobTemplate.spec.template.metadata.labels` (CronJob);
+- `spec.volumeClaimTemplates[*].metadata.labels`.
+
+Give each component its own value, `<name>-<component>` by convention
+(`taric-postgres`, `taric-updater`). The label is fine on objects no selector
+reads, such as a Service's or StatefulSet's own metadata.
+
+Annotate a PVC yourself with `k8up.io/backup: "false"` (or `"true"`) when
+backups are on. K8up's operator default is to back up every claim in the
+namespace, and a raw file copy of a live database is not a backup. Use
+`backup.postgres`/`backup.sqlite` for that. Add `argocd.argoproj.io/sync-options:
+Delete=false` to a PVC whose data matters, as the chart does for its own claims
+(see [Storage](#storage)).
+
+### Example: an app with its own Postgres and a nightly job
+
+taric runs its own PostgreSQL next to the web Deployment, plus a daily CronJob
+on the app's own image. Trimmed to the parts that use the chart:
+
+```yaml
+name: taric
+image: taric-sk-frontend          # imageTag comes from versions/taric.yaml
+env:
+  DB_HOST: postgres
+  DB_PORT: 5432
+  POSTGRES_DB: taricsk
+  POSTGRES_USER: taricsk
+
+extraObjects:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: taric-postgres-data
+      labels: {app.kubernetes.io/name: taric-postgres}
+      annotations:
+        argocd.argoproj.io/sync-options: Delete=false
+        k8up.io/backup: "false"          # backed up by pg_dump instead
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: local-path-retain
+      resources: {requests: {storage: 2Gi}}
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: postgres
+      labels: {app.kubernetes.io/name: taric-postgres}
+    spec:
+      selector: {app.kubernetes.io/name: taric-postgres}
+      ports: [{name: postgres, port: 5432, targetPort: postgres}]
+
+  - apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: postgres
+      labels: {app.kubernetes.io/name: taric-postgres}
+    spec:
+      serviceName: postgres
+      replicas: 1
+      selector: {matchLabels: {app.kubernetes.io/name: taric-postgres}}
+      template:
+        metadata:
+          labels: {app.kubernetes.io/name: taric-postgres}
+        spec:
+          containers:
+            - name: postgres
+              image: docker.io/library/postgres:17.11
+              ports: [{name: postgres, containerPort: 5432}]
+              env:
+                - {name: POSTGRES_USER, value: '{{ .Values.env.POSTGRES_USER }}'}
+                - {name: POSTGRES_DB, value: '{{ .Values.env.POSTGRES_DB }}'}
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: '{{ include "app.secretName" . }}'
+                      key: POSTGRES_PASSWORD
+                - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+              volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+          volumes:
+            - {name: data, persistentVolumeClaim: {claimName: taric-postgres-data}}
+
+  - apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: updater
+      labels: {app.kubernetes.io/name: taric-updater}
+    spec:
+      schedule: "30 4 * * *"
+      concurrencyPolicy: Forbid
+      jobTemplate:
+        spec:
+          template:
+            metadata:
+              labels: {app.kubernetes.io/name: taric-updater}
+            spec:
+              restartPolicy: Never
+              imagePullSecrets:
+                - name: '{{ include "app.pullSecretName" . }}'
+              containers:
+                - name: updater
+                  # The web pod's image and tag: one CI bump moves both.
+                  image: '{{ include "app.imageRepository" . }}:{{ required "imageTag is empty" .Values.imageTag }}'
+                  args: [bundle, exec, rake, nomenclatures:update]
+                  envFrom:
+                    - secretRef: {name: '{{ include "app.secretName" . }}'}
+                  env:
+                    - {name: DB_HOST, value: '{{ .Values.env.DB_HOST }}'}
+                    - {name: DB_PORT, value: '{{ .Values.env.DB_PORT }}'}
+```
+
+The image could equally be spelled
+`'{{ .Values.registry.host }}/apps/{{ .Values.image }}:{{ .Values.imageTag }}'`.
+`app.imageRepository` is the same expansion and also handles an `image` with a
+slash.
+
+The pull secret `<name>-registry` exists only when the chart decides the app
+pulls from zot, which happens automatically when `image` or an init container
+resolves to `registry.host`. An app whose own `image` is public, or empty, but
+whose extra workload pulls from zot needs `registry.pullSecret: true`.
+
+`backup.postgres` reaches this in-namespace database over the same `env:`
+(`hostEnv: DB_HOST` …), so no `externalServices` entry is needed. Do not add an
+`externalServices.postgres` next to an extra Service named `postgres`, because
+both would be a Service of that name.
 
 ## Local rendering
 

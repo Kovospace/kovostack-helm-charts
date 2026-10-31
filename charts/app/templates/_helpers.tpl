@@ -272,3 +272,36 @@ nightly backup ample time to finish first.
 {{- end -}}
 {{- .value -}}
 {{- end -}}
+
+{{/* ---------------------------------------------------------- extraObjects */}}
+
+{{/*
+A values tree with every string in it — keys and values — rendered through
+`tpl` against .root, returned as JSON {"v": <tree>} (fromJson only takes an
+object). Walked rather than serialised to YAML and templated as one text:
+toYaml folds strings longer than ~80 characters, which cuts a template action
+in two and fails the parse. Walking also keeps a templated value a string, so
+it cannot inject YAML structure, and leaves numbers and booleans as they were.
+*/}}
+{{- define "app.tplWalk" -}}
+{{- $v := .value -}}
+{{- if kindIs "map" $v -}}
+{{- $out := dict -}}
+{{- range $k, $x := $v -}}
+{{- $key := $k -}}
+{{- if contains "{{" $k -}}{{- $key = tpl $k $.root -}}{{- end -}}
+{{- $_ := set $out $key (include "app.tplWalk" (dict "value" $x "root" $.root) | fromJson).v -}}
+{{- end -}}
+{{- toJson (dict "v" $out) -}}
+{{- else if kindIs "slice" $v -}}
+{{- $out := list -}}
+{{- range $x := $v -}}
+{{- $out = append $out (include "app.tplWalk" (dict "value" $x "root" $.root) | fromJson).v -}}
+{{- end -}}
+{{- toJson (dict "v" $out) -}}
+{{- else if and (kindIs "string" $v) (contains "{{" $v) -}}
+{{- toJson (dict "v" (tpl $v .root)) -}}
+{{- else -}}
+{{- toJson (dict "v" $v) -}}
+{{- end -}}
+{{- end -}}
