@@ -1,0 +1,111 @@
+{{- /*
+Arbitrary extra manifests in the app's own release — a database StatefulSet, a
+CronJob, anything the chart has no value for. See "Extra objects" in the README.
+
+Each item is a map (a manifest) or a string (a manifest as YAML), rendered
+through `tpl` with the root context so it can use .Values and the chart's
+helpers: a string as one template, a map string by string (app.tplWalk). One
+document per item.
+
+Rendered as written, with two exceptions:
+
+  namespace   set to the app's namespace when the item has none, as every other
+              template here does. A cluster-scoped kind is refused unless the
+              `applications` AppProject permits it.
+  labels      none are added. The chart's selector label is what the app's
+              Service, Deployment and backup Schedule select on; see the guard
+              below for why it is also refused where it would widen them.
+*/}}
+{{- $appName := include "app.name" . }}
+{{- $ns := include "app.namespace" . }}
+{{- $nameLabel := "app.kubernetes.io/name" }}
+{{- /* Cluster-scoped kinds the `applications` AppProject lets an app create. */}}
+{{- $clusterAllowed := list "Namespace" "ClusterSecretStore" }}
+{{- /* Common cluster-scoped kinds, refused rather than silently given a namespace. */}}
+{{- $clusterScoped := list
+      "ClusterRole" "ClusterRoleBinding" "CustomResourceDefinition"
+      "PersistentVolume" "StorageClass" "PriorityClass" "IngressClass"
+      "RuntimeClass" "CSIDriver" "CSINode" "VolumeAttachment" "Node"
+      "APIService" "MutatingWebhookConfiguration" "ValidatingWebhookConfiguration"
+      "ValidatingAdmissionPolicy" "ValidatingAdmissionPolicyBinding"
+      "ClusterIssuer" "ClusterExternalSecret" "ClusterGenerator"
+      "VolumeSnapshotClass" "VolumeSnapshotContent" "FlowSchema"
+      "PriorityLevelConfiguration" }}
+{{- range $i, $item := .Values.extraObjects }}
+{{- $where := printf "extraObjects[%d]" $i }}
+{{- $obj := dict }}
+{{- if kindIs "string" $item }}
+{{- /* A string is one template: rendered as text, then parsed. */}}
+{{- $rendered := trim (tpl $item $) }}
+{{- $rendered = trim (trimPrefix "---" $rendered) }}
+{{- if regexMatch "(?m)^---([ \t]|$)" $rendered }}
+{{- fail (printf "%s holds more than one YAML document — give each manifest its own list item" $where) }}
+{{- end }}
+{{- $obj = fromYaml $rendered }}
+{{- if hasKey $obj "Error" }}
+{{- fail (printf "%s is not valid YAML after tpl: %s" $where $obj.Error) }}
+{{- end }}
+{{- else if kindIs "map" $item }}
+{{- /* A map: each string in it rendered on its own (see app.tplWalk). A
+       fresh copy, so setting the namespace below never writes into .Values. */}}
+{{- $obj = (include "app.tplWalk" (dict "value" $item "root" $) | fromJson).v }}
+{{- else }}
+{{- fail (printf "%s must be a manifest (a map) or a manifest as a YAML string, not %s" $where (kindOf $item)) }}
+{{- end }}
+{{- if not (and $obj.apiVersion $obj.kind) }}
+{{- fail (printf "%s needs apiVersion and kind" $where) }}
+{{- end }}
+{{- $where = printf "%s (%s)" $where $obj.kind }}
+{{- if not (kindIs "map" $obj.metadata) }}
+{{- fail (printf "%s needs metadata.name" $where) }}
+{{- end }}
+{{- if not $obj.metadata.name }}
+{{- fail (printf "%s needs metadata.name" $where) }}
+{{- end }}
+{{- $where = printf "extraObjects[%d] (%s %s)" $i $obj.kind $obj.metadata.name }}
+
+{{- /* ---- namespace ---- */}}
+{{- if has $obj.kind $clusterAllowed }}
+{{- if $obj.metadata.namespace }}
+{{- fail (printf "%s is cluster-scoped and cannot have metadata.namespace" $where) }}
+{{- end }}
+{{- else if has $obj.kind $clusterScoped }}
+{{- fail (printf "%s is cluster-scoped; the `applications` AppProject permits only %s as cluster-scoped kinds, so it would be refused at sync" $where (join " and " $clusterAllowed)) }}
+{{- else if not $obj.metadata.namespace }}
+{{- $_ := set $obj.metadata "namespace" $ns }}
+{{- end }}
+
+{{- /* ---- selector guard ----
+The app's Service and Deployment select pods, and the backup Schedule selects
+PVCs and PreBackupPods, by `app.kubernetes.io/name: <name>` alone. An extra
+object carrying that label where those selectors look would join them: its pods
+would receive the web Service's traffic (and confuse the Deployment's
+ReplicaSet), its claims would be backed up file by file. Refused rather than
+documented, so a copy-pasted label cannot do it quietly. */}}
+{{- $labelSets := list }}
+{{- if has $obj.kind (list "Pod" "PersistentVolumeClaim" "PreBackupPod") }}
+{{- $labelSets = append $labelSets (dict "at" "metadata.labels" "labels" $obj.metadata.labels) }}
+{{- end }}
+{{- with $obj.spec }}
+{{- if kindIs "map" . }}
+{{- with .template }}{{ with .metadata }}
+{{- $labelSets = append $labelSets (dict "at" "spec.template.metadata.labels" "labels" .labels) }}
+{{- end }}{{ end }}
+{{- with .jobTemplate }}{{ with .spec }}{{ with .template }}{{ with .metadata }}
+{{- $labelSets = append $labelSets (dict "at" "spec.jobTemplate.spec.template.metadata.labels" "labels" .labels) }}
+{{- end }}{{ end }}{{ end }}{{ end }}
+{{- range $j, $vct := .volumeClaimTemplates }}
+{{- with $vct.metadata }}
+{{- $labelSets = append $labelSets (dict "at" (printf "spec.volumeClaimTemplates[%d].metadata.labels" $j) "labels" .labels) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- range $labelSets }}
+{{- if and (kindIs "map" .labels) (eq (toString (index .labels $nameLabel | default "")) $appName) }}
+{{- fail (printf "%s sets %s %s: %s, which the app's Service, Deployment and backup Schedule select on — use a label of its own, e.g. %s: %s-<component>" $where .at $nameLabel $appName $nameLabel $appName) }}
+{{- end }}
+{{- end }}
+---
+{{ toYaml $obj }}
+{{- end }}
