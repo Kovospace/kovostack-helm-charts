@@ -1,10 +1,31 @@
 {{- if .Values.host }}
-{{- $hosts := list .Values.host }}
-{{- if .Values.wwwAlias }}
-{{- if hasPrefix "www." .Values.host }}
-{{- fail (printf "host %q already starts with www. — wwwAlias would ask for www.%s" .Values.host .Values.host) }}
+{{- /* `host` is a string or a list of strings; normalise to a list. */}}
+{{- $given := list }}
+{{- if kindIs "string" .Values.host }}
+{{- $given = list .Values.host }}
+{{- else if kindIs "slice" .Values.host }}
+{{- $given = .Values.host }}
+{{- else }}
+{{- fail (printf "host must be a string or a list of strings, got %s" (kindOf .Values.host)) }}
 {{- end }}
-{{- $hosts = append $hosts (printf "www.%s" .Values.host) }}
+{{- $hosts := list }}
+{{- range $given }}
+{{- if not (kindIs "string" .) }}
+{{- fail (printf "host list entries must be strings, got %s (%v)" (kindOf .) .) }}
+{{- end }}
+{{- if not . }}
+{{- fail "host list contains an empty entry" }}
+{{- end }}
+{{- $hosts = append $hosts . }}
+{{- if $.Values.wwwAlias }}
+{{- if hasPrefix "www." . }}
+{{- fail (printf "host %q already starts with www. — wwwAlias would ask for www.%s" . .) }}
+{{- end }}
+{{- $hosts = append $hosts (printf "www.%s" .) }}
+{{- end }}
+{{- end }}
+{{- if ne (len $hosts) (len (uniq $hosts)) }}
+{{- fail (printf "host lists a name more than once after wwwAlias expansion: %s" (join ", " $hosts)) }}
 {{- end }}
 ---
 # cert-manager's ingress-shim turns this annotation plus the tls block into a
@@ -25,6 +46,9 @@ spec:
     # missing fails the HTTP-01 challenge and takes the *whole* certificate
     # with it — the apex included — so point www at the cluster before turning
     # wwwAlias on, not after.
+    {{- /* The same goes for every domain listed in `host`: each one needs a DNS
+    record pointing at the cluster before it is added to the list. Kept as a
+    template comment so single-host renders stay byte-identical. */}}
     - hosts:
         {{- range $hosts }}
         - {{ . | quote }}

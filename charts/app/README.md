@@ -50,7 +50,7 @@ web deployment:
 
 - **`image` empty** → no Deployment or Service. Namespace, secrets and ingress
   only, for an app whose workload comes from its own chart.
-- **`host` empty** → no Ingress or certificate. For workers, cron jobs and
+- **`host` empty** (empty string or empty list) → no Ingress or certificate. For workers, cron jobs and
   anything with no public route.
 - **`secrets.enabled: false`** → no ExternalSecret, for an app with no secrets.
 - **`backup.enabled: true`** → K8up Schedule, dump pods and backup credentials;
@@ -76,10 +76,34 @@ down, and turns an outage into a crash loop. Liveness should fail only for
 something a restart cures. Each of the two falls back to `healthPath`, and a
 probe with no path at all is not rendered.
 
+## Serving several domains
+
+`host` is normally one string, but it also takes a list. Every entry becomes a
+rule on the same Ingress and a name on the same certificate (one TLS Secret,
+`<name>-tls`):
+
+```yaml
+host:
+  - matejkovac.sk
+  - another-domain.sk
+wwwAlias: true      # also www.matejkovac.sk and www.another-domain.sk
+```
+
+A plain string renders exactly as before, so existing apps need no change. An
+empty list behaves like an empty string (no Ingress). The render fails on a
+non-string entry, on an empty entry, and on any name that appears twice once
+`wwwAlias` has expanded the list (e.g. listing both `kovo.space` and
+`www.kovo.space` with `wwwAlias: true`).
+
+⚠️ **Every domain needs its DNS record before it is added.** The names share one
+certificate, so a single domain whose HTTP-01 challenge fails takes TLS down for
+all of them — the ones already serving included. The `clusterIssuer:
+letsencrypt-staging` advice below applies here too.
+
 ## Serving www as well
 
 `wwwAlias: true` adds `www.<host>` as a second rule on the Ingress and a second
-name on the same certificate:
+name on the same certificate — for every entry when `host` is a list:
 
 ```yaml
 host: kovo.space
@@ -88,8 +112,8 @@ wwwAlias: true      # serves kovo.space and www.kovo.space
 
 Off by default, because it only makes sense for an apex domain — for
 `nsr.matejkovac.sk`, `www.nsr.matejkovac.sk` is not a name anyone types. The
-chart refuses a `host` that already starts with `www.` rather than asking for
-`www.www.…`.
+chart refuses a `host` (or any list entry) that already starts with `www.`
+rather than asking for `www.www.…`.
 
 ⚠️ **Create the DNS record first.** Both names share one certificate, so if
 `www.<host>` has no record pointing at the cluster, its HTTP-01 challenge fails
