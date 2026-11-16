@@ -166,9 +166,21 @@ persistence: {}
 
 # --- ingress ----------------------------------------------------------------
 # Leave `host` empty for an app with no public route (worker, cron, internal).
+# A string serves one domain; a list serves several from one Ingress, all on
+# one certificate:
+#
+#   host:
+#     - matejkovac.sk
+#     - another-domain.sk
+#
+# Every listed domain needs a DNS record pointing at the cluster *before* it is
+# added — one failing name takes the shared certificate down for all of them.
+# An empty string or empty list renders no Ingress. Duplicates (including ones
+# produced by wwwAlias) and non-string entries fail the render.
 host: ""
 
-# Serve www.<host> as well, on the same certificate. For an apex domain
+# Serve www.<host> as well, on the same certificate — for every entry when
+# `host` is a list. For an apex domain
 # (kovo.space) that is what visitors type; for a subdomain
 # (nsr.matejkovac.sk) www.nsr.matejkovac.sk is meaningless, which is why this
 # is off by default.
